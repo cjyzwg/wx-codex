@@ -116,6 +116,7 @@ function createWechatClient(store: MemoryStore) {
     }),
     sendTypingIndicator: vi.fn(async () => undefined),
     sendText: vi.fn(async () => undefined),
+    sendLocalFile: vi.fn(async () => undefined),
   };
 }
 
@@ -157,12 +158,29 @@ function getHandleSingleMessage(runtime: AgentRuntime): (message: InboundMessage
   return (runtime as unknown as { handleSingleMessage: (message: InboundMessage) => Promise<void> }).handleSingleMessage.bind(runtime);
 }
 
-function setThreadSession(store: MemoryStore, userId: string, threads: Array<{ threadId: string; createdAt: number; lastUsedAt: number }>, activeThreadId: string): void {
+function setThreadSession(
+  store: MemoryStore,
+  userId: string,
+  threads: Array<{
+    threadId: string;
+    createdAt: number;
+    lastUsedAt: number;
+    displayCwd?: string | null;
+    cwdSource?: string;
+  }>,
+  activeThreadId: string,
+): void {
   const state = store.loadState();
   state.threadSessions[`bot-id:${userId}`] = {
     activeThreadId,
     lastUsedAt: threads[threads.length - 1]?.lastUsedAt ?? null,
-    threads,
+    threads: threads.map((thread) => ({
+      threadId: thread.threadId,
+      createdAt: thread.createdAt,
+      lastUsedAt: thread.lastUsedAt,
+      displayCwd: thread.displayCwd ?? null,
+      cwdSource: thread.cwdSource ?? "unknown",
+    })),
   };
   store.saveState(state);
 }
@@ -223,7 +241,7 @@ describe("AgentRuntime", () => {
     stale.threadSessions["bot-id:user-stale"] = {
       activeThreadId: "thread-stale",
       lastUsedAt: 123,
-      threads: [{ threadId: "thread-stale", createdAt: 123, lastUsedAt: 123 }],
+      threads: [{ threadId: "thread-stale", createdAt: 123, lastUsedAt: 123, displayCwd: null, cwdSource: "unknown" }],
     };
     store.saveState(stale);
 
@@ -307,7 +325,20 @@ describe("AgentRuntime", () => {
 
     expect(codexBridge.createThread).toHaveBeenCalledTimes(1);
     expect(store.loadState().threadSessions["bot-id:user-a"]?.activeThreadId).toBe("thread-fresh");
+    expect(
+      (store.loadState().threadSessions["bot-id:user-a"]?.threads[0] as {
+        displayCwd?: string | null;
+        cwdSource?: string;
+      })?.displayCwd,
+    ).toBe(process.cwd());
+    expect(
+      (store.loadState().threadSessions["bot-id:user-a"]?.threads[0] as {
+        displayCwd?: string | null;
+        cwdSource?: string;
+      })?.cwdSource,
+    ).toBe("created_here");
     expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("已切换到新会话"));
+    expect((runtime.getSnapshot().codex as { threadCwd?: string | null }).threadCwd).toBe(process.cwd());
     expect(codexBridge.runTurn).not.toHaveBeenCalled();
   });
 
@@ -318,8 +349,8 @@ describe("AgentRuntime", () => {
       store,
       "user-a",
       [
-        { threadId: "thread-1", createdAt: 1, lastUsedAt: 1 },
-        { threadId: "thread-2", createdAt: 2, lastUsedAt: 2 },
+        { threadId: "thread-1", createdAt: 1, lastUsedAt: 1, displayCwd: "/repo/alpha", cwdSource: "created_here" },
+        { threadId: "thread-2", createdAt: 2, lastUsedAt: 2, displayCwd: null, cwdSource: "attached_external" },
       ],
       "thread-2",
     );
@@ -337,6 +368,8 @@ describe("AgentRuntime", () => {
 
     expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("1."));
     expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("2."));
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("cwd: /repo/alpha"));
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("cwd: unknown (external thread)"));
     expect(codexBridge.runTurn).not.toHaveBeenCalled();
   });
 
@@ -416,7 +449,45 @@ describe("AgentRuntime", () => {
 
     expect(codexBridge.activateThread).toHaveBeenCalledWith("external-thread-abc123");
     expect(store.loadState().threadSessions["bot-id:user-a"]?.activeThreadId).toBe("external-thread-abc123");
+    expect(
+      (store.loadState().threadSessions["bot-id:user-a"]?.threads[0] as {
+        displayCwd?: string | null;
+        cwdSource?: string;
+      })?.displayCwd,
+    ).toBeNull();
+    expect(
+      (store.loadState().threadSessions["bot-id:user-a"]?.threads[0] as {
+        displayCwd?: string | null;
+        cwdSource?: string;
+      })?.cwdSource,
+    ).toBe("attached_external");
     expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("external-thread-abc123"));
+    expect((runtime.getSnapshot().codex as { threadCwd?: string | null }).threadCwd).toBe("unknown (external thread)");
+  });
+
+  it("exposes the active thread cwd in the codex snapshot for the tui", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+    setThreadSession(
+      store,
+      "user-a",
+      [
+        { threadId: "thread-1", createdAt: 1, lastUsedAt: 1, displayCwd: "/repo/one", cwdSource: "created_here" },
+        { threadId: "thread-2", createdAt: 2, lastUsedAt: 2, displayCwd: null, cwdSource: "attached_external" },
+      ],
+      "thread-2",
+    );
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: createWechatClient(store) as never,
+      codexBridge: createCodexBridge() as never,
+    });
+
+    await runtime.initialize();
+
+    expect(runtime.getSnapshot().codex.threadId).toBe("thread-2");
+    expect((runtime.getSnapshot().codex as { threadCwd?: string | null }).threadCwd).toBe("unknown (external thread)");
   });
 
   it("replies directly for unsupported message types without calling codex", async () => {
@@ -585,5 +656,35 @@ describe("AgentRuntime", () => {
 
     expect(wechatClient.sendText).toHaveBeenCalledTimes(1);
     expect(wechatClient.sendText).toHaveBeenCalledWith("user-e", "当前这个项目根目录下主要有这些目录：\n- dist\n- happy\n- src");
+  });
+
+  it("sends local files back to WeChat when codex emits wx_send markers", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+
+    const wechatClient = createWechatClient(store);
+    const codexBridge = createCodexBridge({
+      runTurn: vi.fn(async (_prompt: string, options?: { onText?: (text: string, meta: { isFinal: boolean }) => Promise<void> | void }) => {
+        await options?.onText?.("分析完成。\n[[wx_send:/tmp/report.txt]]", { isFinal: true });
+        return { replyText: "分析完成。\n[[wx_send:/tmp/report.txt]]", streamedAny: true, finalAlreadyStreamed: true };
+      }),
+    });
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: codexBridge as never,
+    });
+
+    await runtime.initialize();
+    await getHandleSingleMessage(runtime)(message({
+      messageId: 7,
+      fromUserId: "user-f",
+      text: "把结果发我",
+    }));
+
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-f", "分析完成。");
+    expect(wechatClient.sendLocalFile).toHaveBeenCalledWith("user-f", "/tmp/report.txt");
+    expect(wechatClient.sendText).not.toHaveBeenCalledWith("user-f", expect.stringContaining("[[wx_send:"));
   });
 });

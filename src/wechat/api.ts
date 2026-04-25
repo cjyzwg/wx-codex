@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 
-import type { GetConfigResp, GetUpdatesResp, QRCodeResponse, QRStatusResponse, SendMessageReq, SendTypingReq } from "../types.js";
+import type { GetConfigResp, GetUpdatesResp, GetUploadUrlResp, QRCodeResponse, QRStatusResponse, SendMessageReq, SendTypingReq } from "../types.js";
 
 const DEFAULT_API_TIMEOUT_MS = 15_000;
 const QR_LONG_POLL_TIMEOUT_MS = 35_000;
@@ -111,6 +111,45 @@ export async function sendMessage(params: {
     timeoutMs: DEFAULT_API_TIMEOUT_MS,
     label: "sendMessage",
   });
+}
+
+export async function getUploadUrl(params: {
+  baseUrl: string;
+  token?: string;
+  filekey: string;
+  media_type: number;
+  to_user_id: string;
+  rawsize: number;
+  rawfilemd5: string;
+  filesize: number;
+  thumb_rawsize?: number;
+  thumb_rawfilemd5?: string;
+  thumb_filesize?: number;
+  no_need_thumb?: boolean;
+  aeskey?: string;
+}): Promise<GetUploadUrlResp> {
+  const raw = await apiFetch({
+    baseUrl: params.baseUrl,
+    endpoint: "ilink/bot/getuploadurl",
+    body: JSON.stringify({
+      filekey: params.filekey,
+      media_type: params.media_type,
+      to_user_id: params.to_user_id,
+      rawsize: params.rawsize,
+      rawfilemd5: params.rawfilemd5,
+      filesize: params.filesize,
+      thumb_rawsize: params.thumb_rawsize,
+      thumb_rawfilemd5: params.thumb_rawfilemd5,
+      thumb_filesize: params.thumb_filesize,
+      no_need_thumb: params.no_need_thumb,
+      aeskey: params.aeskey,
+      base_info: buildBaseInfo(),
+    }),
+    token: params.token,
+    timeoutMs: DEFAULT_API_TIMEOUT_MS,
+    label: "getUploadUrl",
+  });
+  return JSON.parse(raw) as GetUploadUrlResp;
 }
 
 export async function fetchQrCode(baseUrl: string): Promise<QRCodeResponse> {

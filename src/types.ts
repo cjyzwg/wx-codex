@@ -4,6 +4,7 @@ export type WechatLoginState = "logged_out" | "logging_in" | "logged_in";
 export type CodexStatus = "disconnected" | "connecting" | "idle" | "busy" | "error";
 export type AgentStatus = "stopped" | "running" | "paused" | "error";
 export type QrStatus = "wait" | "scaned" | "confirmed" | "expired";
+export type ThreadCwdSource = "created_here" | "attached_external" | "unknown";
 
 export interface AccountData {
   botToken: string;
@@ -23,6 +24,8 @@ export interface CodexThreadRecord {
   threadId: string;
   createdAt: number;
   lastUsedAt: number;
+  displayCwd: string | null;
+  cwdSource: ThreadCwdSource;
 }
 
 export interface UserThreadSession {
@@ -58,6 +61,7 @@ export interface CodexCardState {
   version: string | null;
   status: CodexStatus;
   threadId: string | null;
+  threadCwd: string | null;
   lastConnectedAt: number | null;
   lastError: string | null;
 }
@@ -175,6 +179,11 @@ export interface GetUpdatesResp {
   errmsg?: string;
   msgs?: WeixinMessage[];
   get_updates_buf?: string;
+}
+
+export interface GetUploadUrlResp {
+  upload_param?: string;
+  thumb_upload_param?: string;
 }
 
 export interface SendMessageReq {

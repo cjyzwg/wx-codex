@@ -36,14 +36,27 @@ describe("WechatStore", () => {
     const store = createStore();
     const state = store.loadState() as typeof store.loadState extends () => infer T
       ? T & {
-          threadSessions: Record<string, { activeThreadId: string | null; lastUsedAt: number | null; threads: Array<{ threadId: string; createdAt: number; lastUsedAt: number }> }>;
+          threadSessions: Record<
+            string,
+            {
+              activeThreadId: string | null;
+              lastUsedAt: number | null;
+              threads: Array<{
+                threadId: string;
+                createdAt: number;
+                lastUsedAt: number;
+                displayCwd: string | null;
+                cwdSource: string;
+              }>;
+            }
+          >;
         }
       : never;
     state.threadSessions = {
       "bot:user-a": {
         activeThreadId: "thread-1",
         lastUsedAt: 123,
-        threads: [{ threadId: "thread-1", createdAt: 123, lastUsedAt: 123 }],
+        threads: [{ threadId: "thread-1", createdAt: 123, lastUsedAt: 123, displayCwd: "/repo/a", cwdSource: "created_here" }],
       },
     };
     state.agentStatus = "running";
@@ -53,6 +66,8 @@ describe("WechatStore", () => {
 
     const reread = store.loadState() as typeof state;
     expect(reread.threadSessions["bot:user-a"]?.activeThreadId).toBe("thread-1");
+    expect(reread.threadSessions["bot:user-a"]?.threads[0]?.displayCwd).toBe("/repo/a");
+    expect(reread.threadSessions["bot:user-a"]?.threads[0]?.cwdSource).toBe("created_here");
     expect(reread.agentStatus).toBe("running");
     expect(reread.codexStatus).toBe("idle");
     expect(reread.lastError).toBe("none");
@@ -62,14 +77,27 @@ describe("WechatStore", () => {
     const store = createStore();
     const state = store.loadState() as typeof store.loadState extends () => infer T
       ? T & {
-          threadSessions: Record<string, { activeThreadId: string | null; lastUsedAt: number | null; threads: Array<{ threadId: string; createdAt: number; lastUsedAt: number }> }>;
+          threadSessions: Record<
+            string,
+            {
+              activeThreadId: string | null;
+              lastUsedAt: number | null;
+              threads: Array<{
+                threadId: string;
+                createdAt: number;
+                lastUsedAt: number;
+                displayCwd: string | null;
+                cwdSource: string;
+              }>;
+            }
+          >;
         }
       : never;
     state.threadSessions = {
       "bot:user-b": {
         activeThreadId: "thread-2",
         lastUsedAt: 456,
-        threads: [{ threadId: "thread-2", createdAt: 456, lastUsedAt: 456 }],
+        threads: [{ threadId: "thread-2", createdAt: 456, lastUsedAt: 456, displayCwd: null, cwdSource: "unknown" }],
       },
     };
     state.contextTokens["bot:user"] = "ctx";
@@ -104,5 +132,34 @@ describe("WechatStore", () => {
 
     expect(loaded.legacySharedThreadId).toBe("thread-legacy");
     expect(loaded.threadSessions).toEqual({});
+  });
+
+  it("normalizes older thread records that do not yet include cwd metadata", () => {
+    const store = createStore();
+    const statePath = path.join(store.getDataDir(), "state.json");
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        updatesBuf: "",
+        contextTokens: {},
+        lastMessageId: 0,
+        threadSessions: {
+          "bot:user-a": {
+            activeThreadId: "thread-1",
+            lastUsedAt: 123,
+            threads: [{ threadId: "thread-1", createdAt: 123, lastUsedAt: 123 }],
+          },
+        },
+        agentStatus: "stopped",
+        codexStatus: "disconnected",
+        lastError: null,
+      }),
+      "utf8",
+    );
+
+    const loaded = store.loadState();
+
+    expect(loaded.threadSessions["bot:user-a"]?.threads[0]?.displayCwd).toBeNull();
+    expect(loaded.threadSessions["bot:user-a"]?.threads[0]?.cwdSource).toBe("unknown");
   });
 });

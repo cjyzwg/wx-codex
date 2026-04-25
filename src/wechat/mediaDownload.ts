@@ -65,7 +65,7 @@ function detectImageExtension(buffer: Buffer): { extension: string; contentType:
   return { extension: ".bin", contentType: "application/octet-stream" };
 }
 
-function getMimeFromFilename(filename: string): string {
+export function getMimeFromFilename(filename: string): string {
   const ext = path.extname(filename).toLowerCase();
   const map: Record<string, string> = {
     ".pdf": "application/pdf",

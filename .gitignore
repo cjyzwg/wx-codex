@@ -7,4 +7,5 @@ coverage/
 .vscode/
 .idea/
 .wxcodex/
+.tmp/
 

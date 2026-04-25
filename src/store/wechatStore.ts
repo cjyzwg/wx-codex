@@ -1,7 +1,71 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import type { AccountData, QrLoginState, RuntimeState } from "../types.js";
+import type { AccountData, CodexThreadRecord, QrLoginState, RuntimeState, ThreadCwdSource, UserThreadSession } from "../types.js";
+
+function normalizeCwdSource(value: unknown, displayCwd: string | null): ThreadCwdSource {
+  if (value === "created_here" || value === "attached_external" || value === "unknown") {
+    return value;
+  }
+  return displayCwd ? "created_here" : "unknown";
+}
+
+function normalizeThreadRecord(value: unknown): CodexThreadRecord | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const raw = value as Partial<CodexThreadRecord> & { displayCwd?: unknown; cwdSource?: unknown };
+  if (typeof raw.threadId !== "string" || !raw.threadId) {
+    return null;
+  }
+
+  const displayCwd = typeof raw.displayCwd === "string" && raw.displayCwd.length > 0 ? raw.displayCwd : null;
+  return {
+    threadId: raw.threadId,
+    createdAt: typeof raw.createdAt === "number" ? raw.createdAt : 0,
+    lastUsedAt: typeof raw.lastUsedAt === "number" ? raw.lastUsedAt : typeof raw.createdAt === "number" ? raw.createdAt : 0,
+    displayCwd,
+    cwdSource: normalizeCwdSource(raw.cwdSource, displayCwd),
+  };
+}
+
+function normalizeThreadSession(value: unknown): UserThreadSession | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const raw = value as Partial<UserThreadSession>;
+  const threads = Array.isArray(raw.threads)
+    ? raw.threads
+        .map((thread) => normalizeThreadRecord(thread))
+        .filter((thread): thread is CodexThreadRecord => thread !== null)
+    : [];
+
+  return {
+    activeThreadId: typeof raw.activeThreadId === "string" ? raw.activeThreadId : null,
+    lastUsedAt:
+      typeof raw.lastUsedAt === "number"
+        ? raw.lastUsedAt
+        : threads.length > 0
+          ? Math.max(...threads.map((thread) => thread.lastUsedAt))
+          : null,
+    threads,
+  };
+}
+
+function normalizeThreadSessions(value: unknown): RuntimeState["threadSessions"] {
+  if (!value || typeof value !== "object") {
+    return {};
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([key, session]) => {
+      const normalized = normalizeThreadSession(session);
+      return normalized ? [[key, normalized]] : [];
+    }),
+  );
+}
 
 function createDefaultRuntimeState(): RuntimeState {
   return {
@@ -78,7 +142,7 @@ export class WechatStore {
       updatesBuf: raw.updatesBuf || "",
       contextTokens: raw.contextTokens || {},
       lastMessageId: raw.lastMessageId || 0,
-      threadSessions: raw.threadSessions || {},
+      threadSessions: normalizeThreadSessions(raw.threadSessions),
       legacySharedThreadId: raw.legacySharedThreadId ?? raw.sharedThreadId ?? null,
       agentStatus: raw.agentStatus || "stopped",
       codexStatus: raw.codexStatus || "disconnected",

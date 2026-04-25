@@ -90,7 +90,7 @@ export function App({ runtime }: AppProps): React.JSX.Element {
   });
 
   const width = stdout.columns || 120;
-  const logHeight = Math.max(8, (stdout.rows || 32) - 18);
+  const logHeight = Math.max(8, (stdout.rows || 32) - 19);
   const events = snapshot.events.slice(-logHeight + 2);
   const showingQr = snapshot.wechat.loginState === "logging_in" && Boolean(snapshot.wechat.qrText);
   const qrLines = splitQrLines(snapshot.wechat.qrText || "");
@@ -119,6 +119,7 @@ export function App({ runtime }: AppProps): React.JSX.Element {
           <Text>{line("Version", snapshot.codex.version || "-")}</Text>
           <Text>{line("Status", snapshot.codex.status)}</Text>
           <Text>{line("Thread", snapshot.codex.threadId || "-")}</Text>
+          <Text>{line("Thread cwd", snapshot.codex.threadCwd || "-")}</Text>
           <Text>{line("Last error", snapshot.codex.lastError || "-")}</Text>
         </Box>
 

@@ -1,10 +1,24 @@
 import { randomUUID } from "node:crypto";
 
 import type { AppConfig } from "../config.js";
-import type { AgentStatus, CodexCardState, CodexStatus, InboundMedia, InboundMessage, RuntimeEvent, RuntimeSnapshot, RuntimeState, UserThreadSession, WechatCardState } from "../types.js";
+import type {
+  AgentStatus,
+  CodexCardState,
+  CodexStatus,
+  CodexThreadRecord,
+  InboundMedia,
+  InboundMessage,
+  RuntimeEvent,
+  RuntimeSnapshot,
+  RuntimeState,
+  ThreadCwdSource,
+  UserThreadSession,
+  WechatCardState,
+} from "../types.js";
 import { WechatStore } from "../store/wechatStore.js";
 import { CodexBridge } from "../codex/codexBridge.js";
 import { WechatClient } from "../wechat/wechatClient.js";
+import { processWechatReplyChunk } from "./wechatReply.js";
 
 type Listener = (snapshot: RuntimeSnapshot) => void;
 type PendingMediaContext = {
@@ -164,7 +178,7 @@ export class AgentRuntime {
       nextState.agentStatus = "running";
       nextState.lastError = null;
       this.store.saveState(nextState);
-      this.snapshot.codex.threadId = this.findMostRecentThreadId(nextState);
+      this.setSnapshotThread(this.findMostRecentThreadId(nextState), nextState);
       this.snapshot.codex.status = "idle";
       this.snapshot.codex.lastConnectedAt = Date.now();
       this.publish();
@@ -210,7 +224,7 @@ export class AgentRuntime {
 
     await this.codexBridge.disconnect();
     this.snapshot.codex.status = "disconnected";
-    this.snapshot.codex.threadId = null;
+    this.setSnapshotThread(null);
     this.persistRuntimeState("disconnected", "stopped", null);
     this.pushEvent("info", "Agent stopped.");
     this.publish();
@@ -256,7 +270,7 @@ export class AgentRuntime {
     this.wechatClient.clearLogin();
     await this.codexBridge.resetSharedThread();
     this.snapshot.wechat = this.buildWechatState();
-    this.snapshot.codex.threadId = null;
+    this.setSnapshotThread(null);
     this.snapshot.codex.status = this.snapshot.codex.available ? "disconnected" : "error";
     this.snapshot.agent.status = "stopped";
     this.pushEvent("warn", "WeChat login was reset. Scan the new QR code to log in again.");
@@ -268,12 +282,12 @@ export class AgentRuntime {
     try {
       const threadId = await this.codexBridge.reconnect(this.snapshot.codex.threadId);
       this.snapshot.codex.status = "idle";
-      this.snapshot.codex.threadId = threadId;
       this.snapshot.codex.lastConnectedAt = Date.now();
       const nextState = this.store.loadState();
       nextState.codexStatus = "idle";
       nextState.lastError = null;
       this.store.saveState(nextState);
+      this.setSnapshotThread(threadId, nextState);
       this.pushEvent("info", threadId ? "Codex reconnected and resumed the active thread." : "Codex reconnected.");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -409,10 +423,11 @@ export class AgentRuntime {
 
     const threadId = await this.ensureMessageThread(message.fromUserId);
     const formattedPrompt = this.buildPrompt(message, pendingMedia);
+    let replyCarryover = "";
     if (pendingMedia) {
       this.clearPendingMedia(message.fromUserId);
     }
-    this.snapshot.codex.threadId = threadId;
+    this.setSnapshotThread(threadId);
     this.pushEvent("info", `Codex is handling a turn for ${message.fromUserId}.`);
 
     try {
@@ -428,19 +443,21 @@ export class AgentRuntime {
       }, this.config.typingIntervalMs);
 
       const result = await this.codexBridge.runTurn(formattedPrompt, {
-        onText: async (text) => {
-          const chunk = text.trim();
-          if (!chunk) {
-            return;
-          }
-          await this.wechatClient.sendText(message.fromUserId, chunk);
-          this.pushEvent("info", `Streamed Codex text to ${message.fromUserId}: ${this.compactText(chunk)}`);
+        onText: async (text, meta) => {
+          const processed = processWechatReplyChunk(text, replyCarryover, meta?.isFinal ?? false);
+          replyCarryover = processed.carryover;
+          await this.deliverWechatReplyChunk(
+            message.fromUserId,
+            processed,
+            meta?.isFinal ? "Reply sent" : "Streamed Codex text",
+          );
         },
       });
 
       if (!result.finalAlreadyStreamed) {
-        await this.wechatClient.sendText(message.fromUserId, result.replyText);
-        this.pushEvent("info", `Reply sent to ${message.fromUserId}: ${this.compactText(result.replyText)}`);
+        const processed = processWechatReplyChunk(result.replyText, replyCarryover, true);
+        replyCarryover = processed.carryover;
+        await this.deliverWechatReplyChunk(message.fromUserId, processed, "Reply sent");
       }
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
@@ -491,7 +508,9 @@ export class AgentRuntime {
 
         const lines = ["当前会话列表：", "使用 /use 序号 切换最稳，也支持唯一的 thread 片段。"];
         session.threads.forEach((thread, index) => {
-          lines.push(`${index + 1}. ${thread.threadId}${thread.threadId === session.activeThreadId ? " (当前)" : ""}`);
+          lines.push(
+            `${index + 1}. ${thread.threadId}${thread.threadId === session.activeThreadId ? " (当前)" : ""} | cwd: ${this.formatThreadCwd(thread)}`,
+          );
         });
         await this.wechatClient.sendText(message.fromUserId, lines.join("\n"));
         return;
@@ -501,9 +520,12 @@ export class AgentRuntime {
       if (selected.status === "missing") {
         try {
           const externalThreadId = await this.codexBridge.activateThread(command.target);
-          this.markThreadActive(session, externalThreadId, Date.now());
+          this.markThreadActive(session, externalThreadId, Date.now(), {
+            displayCwd: null,
+            cwdSource: "attached_external",
+          });
           this.persistThreadSession(state, message.fromUserId, session);
-          this.snapshot.codex.threadId = externalThreadId;
+          this.setSnapshotThread(externalThreadId, state);
           await this.wechatClient.sendText(message.fromUserId, `已接入外部会话：${externalThreadId}`);
           this.pushEvent("info", `Attached external Codex thread for ${message.fromUserId}: ${externalThreadId}.`);
           return;
@@ -522,7 +544,7 @@ export class AgentRuntime {
 
       this.markThreadActive(session, selected.threadId, Date.now());
       this.persistThreadSession(state, message.fromUserId, session);
-      this.snapshot.codex.threadId = selected.threadId;
+      this.setSnapshotThread(selected.threadId, state);
       await this.wechatClient.sendText(message.fromUserId, `已切换到会话：${selected.threadId}`);
       this.pushEvent("info", `Switched ${message.fromUserId} to Codex thread ${selected.threadId}.`);
     } catch (error) {
@@ -797,11 +819,13 @@ export class AgentRuntime {
 
   private buildCodexState(): CodexCardState {
     const runtimeState = this.store.loadState();
+    const threadId = this.findMostRecentThreadId(runtimeState);
     return {
       available: false,
       version: null,
       status: runtimeState.codexStatus,
-      threadId: this.findMostRecentThreadId(runtimeState),
+      threadId,
+      threadCwd: this.findThreadCwdLabel(runtimeState, threadId),
       lastConnectedAt: null,
       lastError: runtimeState.lastError,
     };
@@ -838,9 +862,19 @@ export class AgentRuntime {
       this.pushEvent("warn", `Failed to resume thread ${requestedThreadId} for ${userId}; switched to ${resolvedThreadId}.`);
     }
 
-    this.markThreadActive(session, resolvedThreadId, now);
+    this.markThreadActive(
+      session,
+      resolvedThreadId,
+      now,
+      !requestedThreadId || requestedThreadId !== resolvedThreadId
+        ? {
+            displayCwd: process.cwd(),
+            cwdSource: "created_here",
+          }
+        : undefined,
+    );
     this.persistThreadSession(state, userId, session);
-    this.snapshot.codex.threadId = resolvedThreadId;
+    this.setSnapshotThread(resolvedThreadId, state);
     this.snapshot.codex.lastConnectedAt = now;
     return resolvedThreadId;
   }
@@ -849,10 +883,14 @@ export class AgentRuntime {
     const state = this.store.loadState();
     const session = this.getOrCreateThreadSession(state, userId);
     const threadId = await this.codexBridge.createThread();
-    this.markThreadActive(session, threadId, Date.now());
+    const now = Date.now();
+    this.markThreadActive(session, threadId, now, {
+      displayCwd: process.cwd(),
+      cwdSource: "created_here",
+    });
     this.persistThreadSession(state, userId, session);
-    this.snapshot.codex.threadId = threadId;
-    this.snapshot.codex.lastConnectedAt = Date.now();
+    this.setSnapshotThread(threadId, state);
+    this.snapshot.codex.lastConnectedAt = now;
     return threadId;
   }
 
@@ -873,6 +911,8 @@ export class AgentRuntime {
             threadId: state.legacySharedThreadId,
             createdAt: migratedAt,
             lastUsedAt: migratedAt,
+            displayCwd: null,
+            cwdSource: "unknown",
           },
         ],
       };
@@ -904,15 +944,26 @@ export class AgentRuntime {
     return `${account.botId}:${userId}`;
   }
 
-  private markThreadActive(session: UserThreadSession, threadId: string, timestamp: number): void {
+  private markThreadActive(
+    session: UserThreadSession,
+    threadId: string,
+    timestamp: number,
+    metadata?: { displayCwd: string | null; cwdSource: ThreadCwdSource },
+  ): void {
     const existing = session.threads.find((thread) => thread.threadId === threadId);
     if (existing) {
       existing.lastUsedAt = timestamp;
+      if (metadata) {
+        existing.displayCwd = metadata.displayCwd;
+        existing.cwdSource = metadata.cwdSource;
+      }
     } else {
       session.threads.push({
         threadId,
         createdAt: timestamp,
         lastUsedAt: timestamp,
+        displayCwd: metadata?.displayCwd ?? null,
+        cwdSource: metadata?.cwdSource ?? "unknown",
       });
     }
     session.activeThreadId = threadId;
@@ -976,6 +1027,68 @@ export class AgentRuntime {
     }
 
     return latestThreadId;
+  }
+
+  private setSnapshotThread(threadId: string | null, state = this.store.loadState()): void {
+    this.snapshot.codex.threadId = threadId;
+    this.snapshot.codex.threadCwd = this.findThreadCwdLabel(state, threadId);
+  }
+
+  private findThreadRecord(state: RuntimeState, threadId: string): CodexThreadRecord | null {
+    for (const session of Object.values(state.threadSessions)) {
+      const matched = session.threads.find((thread) => thread.threadId === threadId);
+      if (matched) {
+        return matched;
+      }
+    }
+    return null;
+  }
+
+  private findThreadCwdLabel(state: RuntimeState, threadId: string | null): string | null {
+    if (!threadId) {
+      return null;
+    }
+
+    const thread = this.findThreadRecord(state, threadId);
+    return this.formatThreadCwd(thread);
+  }
+
+  private formatThreadCwd(thread: Pick<CodexThreadRecord, "displayCwd" | "cwdSource"> | null | undefined): string {
+    if (thread?.displayCwd) {
+      return thread.displayCwd;
+    }
+
+    if (thread?.cwdSource === "attached_external") {
+      return "unknown (external thread)";
+    }
+
+    return "unknown";
+  }
+
+  private async deliverWechatReplyChunk(
+    userId: string,
+    chunk: { visibleText: string; filePaths: string[] },
+    eventPrefix: string,
+  ): Promise<void> {
+    if (chunk.visibleText) {
+      await this.wechatClient.sendText(userId, chunk.visibleText);
+      this.pushEvent("info", `${eventPrefix} to ${userId}: ${this.compactText(chunk.visibleText)}`);
+    }
+
+    for (const filePath of chunk.filePaths) {
+      try {
+        await this.wechatClient.sendLocalFile(userId, filePath);
+        this.pushEvent("info", `Sent local file back to ${userId}: ${filePath}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.pushEvent("error", `Failed to send local file to ${userId}: ${message}`);
+        try {
+          await this.wechatClient.sendText(userId, `文件回传失败：${message}`);
+        } catch {
+          // Ignore secondary delivery failures; the event log already captured the root cause.
+        }
+      }
+    }
   }
 
   private compactText(text: string): string {

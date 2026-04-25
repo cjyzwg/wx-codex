@@ -2,10 +2,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WechatStore } from "../store/wechatStore.js";
 import { WechatClient } from "../wechat/wechatClient.js";
+import * as mediaUpload from "../wechat/mediaUpload.js";
+
+vi.mock("../wechat/mediaUpload.js", () => ({
+  sendLocalFileToWechat: vi.fn(async () => undefined),
+}));
 
 const tempDirs: string[] = [];
 
@@ -19,6 +24,10 @@ afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+beforeEach(() => {
+  vi.clearAllMocks();
 });
 
 describe("WechatClient voice formatting", () => {
@@ -83,5 +92,33 @@ describe("WechatClient voice formatting", () => {
     expect(formatted.text).toBe("");
     expect(formatted.directReplyText).toContain("语音");
     expect(formatted.directReplyText).toContain("转写");
+  });
+
+  it("uploads and sends a local file attachment for an existing WeChat conversation", async () => {
+    const client = createClient();
+    const store = (client as unknown as { store: WechatStore }).store;
+    store.saveAccount({
+      botToken: "token",
+      botId: "bot-id",
+      userId: "self-id",
+      baseUrl: "https://example.com",
+      savedAt: Date.now(),
+    });
+    const state = store.loadState();
+    state.contextTokens["bot-id:user-a"] = "ctx-a";
+    store.saveState(state);
+
+    const filePath = path.join(store.getDataDir(), "report.txt");
+    fs.writeFileSync(filePath, "report");
+
+    await client.sendLocalFile("user-a", filePath);
+
+    expect(mediaUpload.sendLocalFileToWechat).toHaveBeenCalledWith({
+      baseUrl: "https://example.com",
+      token: "token",
+      contextToken: "ctx-a",
+      toUserId: "user-a",
+      filePath,
+    });
   });
 });

@@ -1,9 +1,11 @@
 import fs from "node:fs";
+import path from "node:path";
 import QRCode from "qrcode";
 
 import type { AccountData, InboundMedia, InboundMessage, InboundVoice, QRStatusResponse, QrStatus, RuntimeState, WeixinMessage } from "../types.js";
 import { WechatStore } from "../store/wechatStore.js";
 import { downloadInboundFile, downloadInboundImage } from "./mediaDownload.js";
+import { sendLocalFileToWechat } from "./mediaUpload.js";
 import { fetchQrCode, generateId, getConfig, getUpdates, pollQrStatus, sendMessage, sendTyping } from "./api.js";
 
 const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
@@ -217,6 +219,32 @@ export class WechatClient {
         typing_ticket: config.typing_ticket,
         status: status === "typing" ? 1 : 2,
       },
+    });
+  }
+
+  async sendLocalFile(to: string, filePath: string): Promise<void> {
+    const account = this.requireAccount();
+    if (!path.isAbsolute(filePath)) {
+      throw new Error(`WeChat file send only supports absolute paths: ${filePath}`);
+    }
+    const resolvedPath = path.resolve(filePath);
+
+    if (!fs.existsSync(resolvedPath)) {
+      throw new Error(`WeChat file send target does not exist: ${resolvedPath}`);
+    }
+
+    const state = this.store.loadState();
+    const contextToken = state.contextTokens[`${account.botId}:${to}`];
+    if (!contextToken) {
+      throw new Error(`No WeChat conversation context found for user ${to}.`);
+    }
+
+    await sendLocalFileToWechat({
+      baseUrl: account.baseUrl,
+      token: account.botToken,
+      contextToken,
+      toUserId: to,
+      filePath: resolvedPath,
     });
   }
 
