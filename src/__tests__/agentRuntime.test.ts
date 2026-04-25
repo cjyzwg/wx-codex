@@ -368,6 +368,34 @@ describe("AgentRuntime", () => {
     expect(codexBridge.runTurn).not.toHaveBeenCalled();
   });
 
+  it("switches the sender when /use targets a unique thread suffix", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+    setThreadSession(
+      store,
+      "user-a",
+      [
+        { threadId: "thread-alpha-1234", createdAt: 1, lastUsedAt: 1 },
+        { threadId: "thread-beta-5678", createdAt: 2, lastUsedAt: 2 },
+      ],
+      "thread-alpha-1234",
+    );
+
+    const wechatClient = createWechatClient(store);
+    const codexBridge = createCodexBridge();
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: codexBridge as never,
+    });
+
+    await runtime.initialize();
+    await getHandleSingleMessage(runtime)(message({ text: "/use 5678" }));
+
+    expect(store.loadState().threadSessions["bot-id:user-a"]?.activeThreadId).toBe("thread-beta-5678");
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("thread-beta-5678"));
+  });
+
   it("replies directly for unsupported message types without calling codex", async () => {
     const store = new MemoryStore();
     saveAccount(store);

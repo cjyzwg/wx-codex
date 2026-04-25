@@ -18,4 +18,10 @@ describe("QR layout helpers", () => {
   it("returns true when the terminal is wide enough for the qr block", () => {
     expect(canRenderQrBlock(80, MOCK_QR)).toBe(true);
   });
+
+  it("ignores ansi escape sequences when measuring terminal qr width", () => {
+    const ansiQr = "\u001B[47m  \u001B[0m\u001B[40m  \u001B[0m";
+
+    expect(canRenderQrBlock(8, ansiQr)).toBe(true);
+  });
 });

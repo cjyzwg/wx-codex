@@ -33,6 +33,11 @@ type ThreadCommand =
   | { type: "list" }
   | { type: "use"; target: string };
 
+type ThreadSelectionResult =
+  | { status: "selected"; threadId: string }
+  | { status: "ambiguous"; matches: string[] }
+  | { status: "missing" };
+
 export class AgentRuntime {
   private readonly listeners = new Set<Listener>();
   private readonly store: WechatStore;
@@ -484,7 +489,7 @@ export class AgentRuntime {
           return;
         }
 
-        const lines = ["当前会话列表："];
+        const lines = ["当前会话列表：", "使用 /use 序号 切换最稳，也支持唯一的 thread 片段。"];
         session.threads.forEach((thread, index) => {
           lines.push(`${index + 1}. ${thread.threadId}${thread.threadId === session.activeThreadId ? " (当前)" : ""}`);
         });
@@ -493,8 +498,15 @@ export class AgentRuntime {
       }
 
       const selected = this.resolveThreadSelection(session, command.target);
-      if (!selected) {
-        await this.wechatClient.sendText(message.fromUserId, "没有找到对应会话，请使用 /threads 查看可切换的会话编号。");
+      if (selected.status === "missing") {
+        await this.wechatClient.sendText(message.fromUserId, "没有找到对应会话，请使用 /threads 查看可切换的会话编号或唯一 thread 片段。");
+        return;
+      }
+      if (selected.status === "ambiguous") {
+        await this.wechatClient.sendText(
+          message.fromUserId,
+          `匹配到多个会话，请改用 /use 序号：\n${selected.matches.map((threadId, index) => `${index + 1}. ${threadId}`).join("\n")}`,
+        );
         return;
       }
 
@@ -897,17 +909,44 @@ export class AgentRuntime {
     session.lastUsedAt = timestamp;
   }
 
-  private resolveThreadSelection(session: UserThreadSession, target: string): { threadId: string } | null {
+  private resolveThreadSelection(session: UserThreadSession, target: string): ThreadSelectionResult {
     const numericIndex = Number.parseInt(target, 10);
     if (Number.isInteger(numericIndex) && String(numericIndex) === target) {
-      return session.threads[numericIndex - 1] || null;
+      const thread = session.threads[numericIndex - 1];
+      if (thread) {
+        return { status: "selected", threadId: thread.threadId };
+      }
     }
 
-    const matches = session.threads.filter((thread) => thread.threadId.startsWith(target));
-    if (matches.length !== 1) {
-      return null;
+    const exactMatch = session.threads.find((thread) => thread.threadId === target);
+    if (exactMatch) {
+      return { status: "selected", threadId: exactMatch.threadId };
     }
-    return matches[0];
+
+    const uniquePrefix = this.findUniqueThreadMatch(session, (threadId) => threadId.startsWith(target));
+    if (uniquePrefix.status !== "missing") {
+      return uniquePrefix;
+    }
+
+    const uniqueSuffix = this.findUniqueThreadMatch(session, (threadId) => threadId.endsWith(target));
+    if (uniqueSuffix.status !== "missing") {
+      return uniqueSuffix;
+    }
+
+    return this.findUniqueThreadMatch(session, (threadId) => threadId.includes(target));
+  }
+
+  private findUniqueThreadMatch(session: UserThreadSession, predicate: (threadId: string) => boolean): ThreadSelectionResult {
+    const matches = session.threads
+      .map((thread) => thread.threadId)
+      .filter(predicate);
+    if (matches.length === 0) {
+      return { status: "missing" };
+    }
+    if (matches.length > 1) {
+      return { status: "ambiguous", matches };
+    }
+    return { status: "selected", threadId: matches[0] };
   }
 
   private findMostRecentThreadId(state: RuntimeState): string | null {

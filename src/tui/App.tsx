@@ -149,6 +149,7 @@ export function App({ runtime }: AppProps): React.JSX.Element {
           <Text bold color={cardColor(snapshot.wechat.qrStatus || "wait")}>WeChat Login</Text>
           <Text>{line("QR status", snapshot.wechat.qrStatus || "wait")}</Text>
           <Text>{line("QR image", snapshot.wechat.qrPath || "-")}</Text>
+          {snapshot.wechat.qrUrl ? <Text>{line("QR url", snapshot.wechat.qrUrl)}</Text> : null}
           {canShowQr ? (
             <Box flexDirection="column" marginTop={1}>
               {qrLines.map((qrLine, index) => (
