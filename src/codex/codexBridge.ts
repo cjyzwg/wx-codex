@@ -207,6 +207,12 @@ export class CodexBridge {
     return started.threadId;
   }
 
+  async activateThread(threadId: string): Promise<string> {
+    await this.connect();
+    const resumed = await this.resumeThread(threadId);
+    return resumed.threadId;
+  }
+
   async resetSharedThread(): Promise<void> {
     this.threadId = null;
   }

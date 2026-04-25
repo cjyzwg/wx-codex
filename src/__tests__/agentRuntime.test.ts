@@ -123,6 +123,7 @@ function createCodexBridge(overrides: Record<string, unknown> = {}) {
   return {
     connect: vi.fn(async () => undefined),
     ensureThread: vi.fn(async (threadId: string | null) => threadId || "thread-123"),
+    activateThread: vi.fn(async (threadId: string) => threadId),
     createThread: vi.fn(async () => "thread-new"),
     runTurn: vi.fn(async () => ({ replyText: "done", streamedAny: false, finalAlreadyStreamed: false })),
     disconnect: vi.fn(async () => undefined),
@@ -394,6 +395,28 @@ describe("AgentRuntime", () => {
 
     expect(store.loadState().threadSessions["bot-id:user-a"]?.activeThreadId).toBe("thread-beta-5678");
     expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("thread-beta-5678"));
+  });
+
+  it("attaches an existing codex thread id even when it is not already in the local thread list", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+
+    const wechatClient = createWechatClient(store);
+    const codexBridge = createCodexBridge({
+      activateThread: vi.fn(async (threadId: string) => threadId),
+    });
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: codexBridge as never,
+    });
+
+    await runtime.initialize();
+    await getHandleSingleMessage(runtime)(message({ text: "/use external-thread-abc123" }));
+
+    expect(codexBridge.activateThread).toHaveBeenCalledWith("external-thread-abc123");
+    expect(store.loadState().threadSessions["bot-id:user-a"]?.activeThreadId).toBe("external-thread-abc123");
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("external-thread-abc123"));
   });
 
   it("replies directly for unsupported message types without calling codex", async () => {

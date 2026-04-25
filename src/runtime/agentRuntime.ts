@@ -499,8 +499,18 @@ export class AgentRuntime {
 
       const selected = this.resolveThreadSelection(session, command.target);
       if (selected.status === "missing") {
-        await this.wechatClient.sendText(message.fromUserId, "没有找到对应会话，请使用 /threads 查看可切换的会话编号或唯一 thread 片段。");
-        return;
+        try {
+          const externalThreadId = await this.codexBridge.activateThread(command.target);
+          this.markThreadActive(session, externalThreadId, Date.now());
+          this.persistThreadSession(state, message.fromUserId, session);
+          this.snapshot.codex.threadId = externalThreadId;
+          await this.wechatClient.sendText(message.fromUserId, `已接入外部会话：${externalThreadId}`);
+          this.pushEvent("info", `Attached external Codex thread for ${message.fromUserId}: ${externalThreadId}.`);
+          return;
+        } catch {
+          await this.wechatClient.sendText(message.fromUserId, "没有找到对应会话，也无法恢复这个外部 Codex 会话 ID。请确认 thread id 是否正确。");
+          return;
+        }
       }
       if (selected.status === "ambiguous") {
         await this.wechatClient.sendText(
