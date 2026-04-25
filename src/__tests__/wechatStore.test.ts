@@ -21,17 +21,38 @@ afterEach(() => {
 });
 
 describe("WechatStore", () => {
+  it("initializes per-user thread session defaults", () => {
+    const store = createStore();
+
+    const state = store.loadState() as typeof store.loadState extends () => infer T
+      ? T & { threadSessions?: Record<string, unknown>; legacySharedThreadId?: string | null }
+      : never;
+
+    expect(state.threadSessions).toEqual({});
+    expect(state.legacySharedThreadId ?? null).toBeNull();
+  });
+
   it("persists runtime state with utf8 JSON", () => {
     const store = createStore();
-    const state = store.loadState();
-    state.sharedThreadId = "thread-1";
+    const state = store.loadState() as typeof store.loadState extends () => infer T
+      ? T & {
+          threadSessions: Record<string, { activeThreadId: string | null; lastUsedAt: number | null; threads: Array<{ threadId: string; createdAt: number; lastUsedAt: number }> }>;
+        }
+      : never;
+    state.threadSessions = {
+      "bot:user-a": {
+        activeThreadId: "thread-1",
+        lastUsedAt: 123,
+        threads: [{ threadId: "thread-1", createdAt: 123, lastUsedAt: 123 }],
+      },
+    };
     state.agentStatus = "running";
     state.codexStatus = "idle";
     state.lastError = "none";
     store.saveState(state);
 
-    const reread = store.loadState();
-    expect(reread.sharedThreadId).toBe("thread-1");
+    const reread = store.loadState() as typeof state;
+    expect(reread.threadSessions["bot:user-a"]?.activeThreadId).toBe("thread-1");
     expect(reread.agentStatus).toBe("running");
     expect(reread.codexStatus).toBe("idle");
     expect(reread.lastError).toBe("none");
@@ -39,15 +60,49 @@ describe("WechatStore", () => {
 
   it("resetState clears queue-related runtime fields", () => {
     const store = createStore();
-    const state = store.loadState();
-    state.sharedThreadId = "thread-2";
+    const state = store.loadState() as typeof store.loadState extends () => infer T
+      ? T & {
+          threadSessions: Record<string, { activeThreadId: string | null; lastUsedAt: number | null; threads: Array<{ threadId: string; createdAt: number; lastUsedAt: number }> }>;
+        }
+      : never;
+    state.threadSessions = {
+      "bot:user-b": {
+        activeThreadId: "thread-2",
+        lastUsedAt: 456,
+        threads: [{ threadId: "thread-2", createdAt: 456, lastUsedAt: 456 }],
+      },
+    };
     state.contextTokens["bot:user"] = "ctx";
     state.lastMessageId = 123;
     store.saveState(state);
 
-    const reset = store.resetState();
-    expect(reset.sharedThreadId).toBeNull();
+    const reset = store.resetState() as typeof state & { legacySharedThreadId?: string | null };
+    expect(reset.threadSessions).toEqual({});
     expect(reset.contextTokens).toEqual({});
     expect(reset.lastMessageId).toBe(0);
+    expect(reset.legacySharedThreadId ?? null).toBeNull();
+  });
+
+  it("exposes legacy sharedThreadId through the migration field", () => {
+    const store = createStore();
+    const statePath = path.join(store.getDataDir(), "state.json");
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        updatesBuf: "",
+        contextTokens: {},
+        lastMessageId: 0,
+        sharedThreadId: "thread-legacy",
+        agentStatus: "stopped",
+        codexStatus: "disconnected",
+        lastError: null,
+      }),
+      "utf8",
+    );
+
+    const loaded = store.loadState() as ReturnType<typeof store.loadState> & { legacySharedThreadId?: string | null; threadSessions?: Record<string, unknown> };
+
+    expect(loaded.legacySharedThreadId).toBe("thread-legacy");
+    expect(loaded.threadSessions).toEqual({});
   });
 });

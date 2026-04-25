@@ -3,6 +3,19 @@ import path from "node:path";
 
 import type { AccountData, QrLoginState, RuntimeState } from "../types.js";
 
+function createDefaultRuntimeState(): RuntimeState {
+  return {
+    updatesBuf: "",
+    contextTokens: {},
+    lastMessageId: 0,
+    threadSessions: {},
+    legacySharedThreadId: null,
+    agentStatus: "stopped",
+    codexStatus: "disconnected",
+    lastError: null,
+  };
+}
+
 export class WechatStore {
   constructor(private readonly dataDir: string) {}
 
@@ -56,21 +69,33 @@ export class WechatStore {
   }
 
   loadState(): RuntimeState {
-    return (
-      this.readJson<RuntimeState>(this.statePath()) || {
-        updatesBuf: "",
-        contextTokens: {},
-        lastMessageId: 0,
-        sharedThreadId: null,
-        agentStatus: "stopped",
-        codexStatus: "disconnected",
-        lastError: null,
-      }
-    );
+    const raw = this.readJson<(Partial<RuntimeState> & { sharedThreadId?: string | null })>(this.statePath());
+    if (!raw) {
+      return createDefaultRuntimeState();
+    }
+
+    return {
+      updatesBuf: raw.updatesBuf || "",
+      contextTokens: raw.contextTokens || {},
+      lastMessageId: raw.lastMessageId || 0,
+      threadSessions: raw.threadSessions || {},
+      legacySharedThreadId: raw.legacySharedThreadId ?? raw.sharedThreadId ?? null,
+      agentStatus: raw.agentStatus || "stopped",
+      codexStatus: raw.codexStatus || "disconnected",
+      lastError: raw.lastError || null,
+    };
   }
 
   saveState(state: RuntimeState): void {
-    this.writeJson(this.statePath(), state);
+    this.writeJson(this.statePath(), {
+      updatesBuf: state.updatesBuf,
+      contextTokens: state.contextTokens,
+      lastMessageId: state.lastMessageId,
+      threadSessions: state.threadSessions,
+      agentStatus: state.agentStatus,
+      codexStatus: state.codexStatus,
+      lastError: state.lastError,
+    });
   }
 
   loadQrState(): QrLoginState | null {
@@ -96,15 +121,7 @@ export class WechatStore {
   }
 
   resetState(): RuntimeState {
-    const nextState: RuntimeState = {
-      updatesBuf: "",
-      contextTokens: {},
-      lastMessageId: 0,
-      sharedThreadId: null,
-      agentStatus: "stopped",
-      codexStatus: "disconnected",
-      lastError: null,
-    };
+    const nextState = createDefaultRuntimeState();
     this.saveState(nextState);
     return nextState;
   }

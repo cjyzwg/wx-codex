@@ -19,11 +19,24 @@ export interface QrLoginState {
   createdAt: number;
 }
 
+export interface CodexThreadRecord {
+  threadId: string;
+  createdAt: number;
+  lastUsedAt: number;
+}
+
+export interface UserThreadSession {
+  activeThreadId: string | null;
+  lastUsedAt: number | null;
+  threads: CodexThreadRecord[];
+}
+
 export interface RuntimeState {
   updatesBuf: string;
   contextTokens: Record<string, string>;
   lastMessageId: number;
-  sharedThreadId: string | null;
+  threadSessions: Record<string, UserThreadSession>;
+  legacySharedThreadId?: string | null;
   agentStatus: AgentStatus;
   codexStatus: CodexStatus;
   lastError: string | null;
