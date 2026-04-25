@@ -3,6 +3,7 @@ import { Box, Text, useApp, useInput, useStdout } from "ink";
 
 import type { RuntimeSnapshot } from "../types.js";
 import { AgentRuntime } from "../runtime/agentRuntime.js";
+import { canRenderQrBlock, splitQrLines } from "./qrLayout.js";
 
 interface AppProps {
   runtime: AgentRuntime;
@@ -92,6 +93,8 @@ export function App({ runtime }: AppProps): React.JSX.Element {
   const logHeight = Math.max(8, (stdout.rows || 32) - 18);
   const events = snapshot.events.slice(-logHeight + 2);
   const showingQr = snapshot.wechat.loginState === "logging_in" && Boolean(snapshot.wechat.qrText);
+  const qrLines = splitQrLines(snapshot.wechat.qrText || "");
+  const canShowQr = showingQr && canRenderQrBlock(width, snapshot.wechat.qrText || "");
 
   return (
     <Box flexDirection="column" width={width}>
@@ -146,8 +149,15 @@ export function App({ runtime }: AppProps): React.JSX.Element {
           <Text bold color={cardColor(snapshot.wechat.qrStatus || "wait")}>WeChat Login</Text>
           <Text>{line("QR status", snapshot.wechat.qrStatus || "wait")}</Text>
           <Text>{line("QR image", snapshot.wechat.qrPath || "-")}</Text>
-          {snapshot.wechat.qrUrl ? <Text>{line("QR url", snapshot.wechat.qrUrl)}</Text> : null}
-          <Text>{snapshot.wechat.qrText || ""}</Text>
+          {canShowQr ? (
+            <Box flexDirection="column" marginTop={1}>
+              {qrLines.map((qrLine, index) => (
+                <Text key={`${snapshot.wechat.qrStatus || "wait"}-${index}`}>{qrLine}</Text>
+              ))}
+            </Box>
+          ) : (
+            <Text color="yellow">Terminal too narrow for a scannable QR code. Enlarge the window and press L or R.</Text>
+          )}
         </Box>
       )}
 

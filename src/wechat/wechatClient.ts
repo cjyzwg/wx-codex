@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import QRCode from "qrcode";
 
-import type { AccountData, InboundMedia, InboundMessage, QRStatusResponse, QrStatus, RuntimeState, WeixinMessage } from "../types.js";
+import type { AccountData, InboundMedia, InboundMessage, InboundVoice, QRStatusResponse, QrStatus, RuntimeState, WeixinMessage } from "../types.js";
 import { WechatStore } from "../store/wechatStore.js";
 import { downloadInboundFile, downloadInboundImage } from "./mediaDownload.js";
 import { fetchQrCode, generateId, getConfig, getUpdates, pollQrStatus, sendMessage, sendTyping } from "./api.js";
@@ -230,7 +230,7 @@ export class WechatClient {
 
   private async writeQrArtifacts(url: string): Promise<string> {
     this.store.ensureDataDir();
-    const qrText = await QRCode.toString(url, { type: "terminal", small: true });
+    const qrText = await QRCode.toString(url, { type: "terminal" });
     await QRCode.toFile(this.store.getQrPngPath(), url, { width: 400, margin: 2 });
     fs.writeFileSync(this.store.getQrTxtPath(), qrText, { encoding: "utf8" });
     return qrText;
@@ -240,6 +240,7 @@ export class WechatClient {
     const textParts: string[] = [];
     const media: InboundMedia[] = [];
     const items = message.item_list || [];
+    let voice: InboundVoice | undefined;
     let directReplyText: string | undefined;
 
     for (const [index, item] of items.entries()) {
@@ -272,8 +273,17 @@ export class WechatClient {
           }
           break;
         case 3:
-          directReplyText = "该消息类型不支持";
-          textParts.push("[Unsupported voice message]");
+          if (item.voice_item?.text?.trim()) {
+            const transcript = item.voice_item.text.trim();
+            voice = {
+              transcript,
+              durationMs: item.voice_item.playtime ?? null,
+              sampleRate: item.voice_item.sample_rate ?? null,
+            };
+            textParts.push(transcript);
+          } else {
+            directReplyText = "这条语音暂时没有拿到可用的转写文本，请再发一次文字试试。";
+          }
           break;
         case 4:
           try {
@@ -323,6 +333,7 @@ export class WechatClient {
       contextToken: message.context_token,
       createTime: message.create_time_ms ? new Date(message.create_time_ms).toISOString() : undefined,
       media,
+      voice,
       rawMessage: message,
       directReplyText,
     };

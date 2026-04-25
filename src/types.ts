@@ -214,6 +214,7 @@ export interface InboundMessage {
   contextToken?: string;
   createTime?: string;
   media?: InboundMedia[];
+  voice?: InboundVoice;
   rawMessage?: WeixinMessage;
   directReplyText?: string;
 }
@@ -224,4 +225,10 @@ export interface InboundMedia {
   source: "item" | "ref";
   contentType?: string;
   fileName?: string;
+}
+
+export interface InboundVoice {
+  transcript: string;
+  durationMs: number | null;
+  sampleRate: number | null;
 }

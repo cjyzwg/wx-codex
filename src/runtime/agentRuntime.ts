@@ -638,6 +638,9 @@ export class AgentRuntime {
 
   private buildPrompt(message: InboundMessage, pendingMedia: InboundMessage[] | null): string {
     if (!pendingMedia || pendingMedia.length === 0) {
+      if (message.voice?.transcript) {
+        return `来自用户 ${message.fromUserId} 的语音转写：${message.voice.transcript}`;
+      }
       return `来自用户 ${message.fromUserId}：${message.text}`;
     }
 
@@ -649,7 +652,7 @@ export class AgentRuntime {
     }
 
     sections.push("用户随后补充说明：");
-    sections.push(message.text);
+    sections.push(message.voice?.transcript ? `语音转写：${message.voice.transcript}` : message.text);
     return sections.join("\n");
   }
 

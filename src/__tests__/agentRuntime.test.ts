@@ -393,6 +393,43 @@ describe("AgentRuntime", () => {
     expect(codexBridge.runTurn).not.toHaveBeenCalled();
   });
 
+  it("labels voice transcription turns before sending them to codex", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+
+    const turns: string[] = [];
+    const wechatClient = createWechatClient(store);
+    const codexBridge = createCodexBridge({
+      runTurn: vi.fn(async (prompt: string) => {
+        turns.push(prompt);
+        return { replyText: "done", streamedAny: false, finalAlreadyStreamed: false };
+      }),
+    });
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: codexBridge as never,
+    });
+
+    await runtime.initialize();
+    await getHandleSingleMessage(runtime)(
+      message({
+        messageId: 21,
+        fromUserId: "user-v",
+        text: "帮我总结一下",
+        voice: {
+          transcript: "帮我总结一下",
+          durationMs: 3200,
+          sampleRate: 16000,
+        },
+      }),
+    );
+
+    expect(turns[0]).toContain("语音转写");
+    expect(turns[0]).toContain("帮我总结一下");
+  });
+
   it("holds image or file messages until the next text message and then sends a type-aware combined prompt to codex", async () => {
     const store = new MemoryStore();
     saveAccount(store);
