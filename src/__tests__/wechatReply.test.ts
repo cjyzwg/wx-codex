@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { processWechatReplyChunk } from "../runtime/wechatReply.js";
+import { processWechatReplyChunk, splitWechatReplyText } from "../runtime/wechatReply.js";
 
 describe("wechat reply marker parsing", () => {
   it("extracts wx_send markers and removes them from visible text", () => {
@@ -32,5 +32,25 @@ describe("wechat reply marker parsing", () => {
 
     expect(result.visibleText).toBe("附件如下：");
     expect(result.filePaths).toEqual(["/tmp/a.txt", "/tmp/b.png"]);
+  });
+
+  it("splits a long reply at natural sentence boundaries before the hard limit", () => {
+    const chunks = splitWechatReplyText("第一段说明。\n第二段补充。\n第三段总结。", 10);
+
+    expect(chunks).toEqual([
+      "第一段说明。",
+      "第二段补充。",
+      "第三段总结。",
+    ]);
+  });
+
+  it("falls back to a hard split when no natural boundary exists within the limit", () => {
+    const chunks = splitWechatReplyText("abcdefghijklmnopqrstuvwxyz", 10);
+
+    expect(chunks).toEqual([
+      "abcdefghij",
+      "klmnopqrst",
+      "uvwxyz",
+    ]);
   });
 });

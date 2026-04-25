@@ -18,7 +18,7 @@ import type {
 import { WechatStore } from "../store/wechatStore.js";
 import { CodexBridge } from "../codex/codexBridge.js";
 import { WechatClient } from "../wechat/wechatClient.js";
-import { processWechatReplyChunk } from "./wechatReply.js";
+import { processWechatReplyChunk, splitWechatReplyText } from "./wechatReply.js";
 
 type Listener = (snapshot: RuntimeSnapshot) => void;
 type PendingMediaContext = {
@@ -33,13 +33,6 @@ export interface RuntimeDeps {
 }
 
 type StartOptions = {
-  announceReady?: boolean;
-};
-
-type PendingStartupReadyNotice = {
-  botId: string;
-  fallbackUserId: string | null;
-  attempts: number;
 };
 
 type ThreadCommand =
@@ -67,8 +60,8 @@ export class AgentRuntime {
   private qrPollInterval: NodeJS.Timeout | null = null;
   private typingInterval: NodeJS.Timeout | null = null;
   private currentTypingUserId: string | null = null;
+  private currentTypingContextToken: string | null = null;
   private readonly pendingMediaByUser = new Map<string, PendingMediaContext>();
-  private pendingStartupReadyNotice: PendingStartupReadyNotice | null = null;
 
   constructor(config: AppConfig, deps: RuntimeDeps = {}) {
     this.config = config;
@@ -183,14 +176,6 @@ export class AgentRuntime {
       this.snapshot.codex.lastConnectedAt = Date.now();
       this.publish();
       this.startPollingLoop();
-      if (options.announceReady) {
-        this.pendingStartupReadyNotice = {
-          botId: account.botId,
-          fallbackUserId: account.userId,
-          attempts: 0,
-        };
-        await this.trySendStartupReadyMessage();
-      }
     } catch (error) {
       this.running = false;
       this.snapshot.agent.status = "error";
@@ -210,7 +195,6 @@ export class AgentRuntime {
     this.running = false;
     this.queue = [];
     this.pendingMediaByUser.clear();
-    this.pendingStartupReadyNotice = null;
     this.snapshot.agent.queueLength = 0;
     this.snapshot.agent.currentUserId = null;
     this.snapshot.agent.status = "stopped";
@@ -239,7 +223,7 @@ export class AgentRuntime {
     if (!this.wechatClient.getAccount()) {
       return;
     }
-    await this.start({ announceReady: true });
+    await this.start();
   }
 
   async beginWechatLogin(forceNew = false): Promise<void> {
@@ -326,8 +310,6 @@ export class AgentRuntime {
 
           this.snapshot.wechat.lastPollAt = Date.now();
           this.publish();
-          await this.trySendStartupReadyMessage();
-
           if (messages.length > 0) {
             for (const message of messages) {
               this.queue.push(message);
@@ -393,7 +375,7 @@ export class AgentRuntime {
 
     if (message.directReplyText) {
       try {
-        await this.wechatClient.sendText(message.fromUserId, message.directReplyText);
+        await this.sendWechatText(message.fromUserId, message.directReplyText, message.contextToken);
         this.pushEvent("warn", `Unsupported message type from ${message.fromUserId}; replied without Codex.`);
       } catch (error) {
         const messageText = error instanceof Error ? error.message : String(error);
@@ -416,7 +398,7 @@ export class AgentRuntime {
 
     const pendingMedia = this.peekPendingMedia(message.fromUserId);
     if (pendingMedia && !message.text.trim()) {
-      await this.wechatClient.sendText(message.fromUserId, this.buildMediaReceiptText(this.collectDeferredMedia(pendingMedia)));
+      await this.sendWechatText(message.fromUserId, this.buildMediaReceiptText(this.collectDeferredMedia(pendingMedia)), message.contextToken);
       this.pushEvent("warn", `Waiting for a text follow-up from ${message.fromUserId} after media upload.`);
       return;
     }
@@ -424,6 +406,8 @@ export class AgentRuntime {
     const threadId = await this.ensureMessageThread(message.fromUserId);
     const formattedPrompt = this.buildPrompt(message, pendingMedia);
     let replyCarryover = "";
+    let streamedReplyText = "";
+    const streamedReplyFiles: string[] = [];
     if (pendingMedia) {
       this.clearPendingMedia(message.fromUserId);
     }
@@ -431,13 +415,18 @@ export class AgentRuntime {
     this.pushEvent("info", `Codex is handling a turn for ${message.fromUserId}.`);
 
     try {
-      await this.wechatClient.sendTypingIndicator(message.fromUserId, "typing");
+      await this.sendWechatTypingIndicator(message.fromUserId, "typing", message.contextToken);
       this.currentTypingUserId = message.fromUserId;
+      this.currentTypingContextToken = message.contextToken || null;
       this.typingInterval = setInterval(() => {
         if (!this.currentTypingUserId) {
           return;
         }
-        void this.wechatClient.sendTypingIndicator(this.currentTypingUserId, "typing").catch(() => {
+        void this.sendWechatTypingIndicator(
+          this.currentTypingUserId,
+          "typing",
+          this.currentTypingContextToken || undefined,
+        ).catch(() => {
           // Ignore heartbeat failures. The main turn flow will surface real errors.
         });
       }, this.config.typingIntervalMs);
@@ -446,19 +435,15 @@ export class AgentRuntime {
         onText: async (text, meta) => {
           const processed = processWechatReplyChunk(text, replyCarryover, meta?.isFinal ?? false);
           replyCarryover = processed.carryover;
-          await this.deliverWechatReplyChunk(
-            message.fromUserId,
-            processed,
-            meta?.isFinal ? "Reply sent" : "Streamed Codex text",
-          );
+          streamedReplyText = this.appendWechatReplyText(streamedReplyText, processed.visibleText);
+          streamedReplyFiles.push(...processed.filePaths);
         },
       });
 
-      if (!result.finalAlreadyStreamed) {
-        const processed = processWechatReplyChunk(result.replyText, replyCarryover, true);
-        replyCarryover = processed.carryover;
-        await this.deliverWechatReplyChunk(message.fromUserId, processed, "Reply sent");
-      }
+      const replyPayload = result.finalAlreadyStreamed
+        ? { visibleText: streamedReplyText, filePaths: streamedReplyFiles }
+        : processWechatReplyChunk(result.replyText, "", true);
+      await this.deliverWechatReplyChunk(message.fromUserId, replyPayload, "Reply sent", message.contextToken);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
       this.snapshot.agent.status = "error";
@@ -492,7 +477,7 @@ export class AgentRuntime {
     try {
       if (command.type === "new") {
         const threadId = await this.createNewThreadForUser(message.fromUserId);
-        await this.wechatClient.sendText(message.fromUserId, `已切换到新会话：${threadId}`);
+        await this.sendWechatText(message.fromUserId, `已切换到新会话：${threadId}`, message.contextToken);
         this.pushEvent("info", `Created a new Codex thread for ${message.fromUserId}: ${threadId}`);
         return;
       }
@@ -502,7 +487,7 @@ export class AgentRuntime {
 
       if (command.type === "list") {
         if (session.threads.length === 0) {
-          await this.wechatClient.sendText(message.fromUserId, "当前还没有会话，直接发消息或输入 /new 创建一个新会话。");
+          await this.sendWechatText(message.fromUserId, "当前还没有会话，直接发消息或输入 /new 创建一个新会话。", message.contextToken);
           return;
         }
 
@@ -512,7 +497,7 @@ export class AgentRuntime {
             `${index + 1}. ${thread.threadId}${thread.threadId === session.activeThreadId ? " (当前)" : ""} | cwd: ${this.formatThreadCwd(thread)}`,
           );
         });
-        await this.wechatClient.sendText(message.fromUserId, lines.join("\n"));
+        await this.sendWechatText(message.fromUserId, lines.join("\n"), message.contextToken);
         return;
       }
 
@@ -526,18 +511,23 @@ export class AgentRuntime {
           });
           this.persistThreadSession(state, message.fromUserId, session);
           this.setSnapshotThread(externalThreadId, state);
-          await this.wechatClient.sendText(message.fromUserId, `已接入外部会话：${externalThreadId}`);
+          await this.sendWechatText(message.fromUserId, `已接入外部会话：${externalThreadId}`, message.contextToken);
           this.pushEvent("info", `Attached external Codex thread for ${message.fromUserId}: ${externalThreadId}.`);
           return;
         } catch {
-          await this.wechatClient.sendText(message.fromUserId, "没有找到对应会话，也无法恢复这个外部 Codex 会话 ID。请确认 thread id 是否正确。");
+          await this.sendWechatText(
+            message.fromUserId,
+            "没有找到对应会话，也无法恢复这个外部 Codex 会话 ID。请确认 thread id 是否正确。",
+            message.contextToken,
+          );
           return;
         }
       }
       if (selected.status === "ambiguous") {
-        await this.wechatClient.sendText(
+        await this.sendWechatText(
           message.fromUserId,
           `匹配到多个会话，请改用 /use 序号：\n${selected.matches.map((threadId, index) => `${index + 1}. ${threadId}`).join("\n")}`,
+          message.contextToken,
         );
         return;
       }
@@ -545,7 +535,7 @@ export class AgentRuntime {
       this.markThreadActive(session, selected.threadId, Date.now());
       this.persistThreadSession(state, message.fromUserId, session);
       this.setSnapshotThread(selected.threadId, state);
-      await this.wechatClient.sendText(message.fromUserId, `已切换到会话：${selected.threadId}`);
+      await this.sendWechatText(message.fromUserId, `已切换到会话：${selected.threadId}`, message.contextToken);
       this.pushEvent("info", `Switched ${message.fromUserId} to Codex thread ${selected.threadId}.`);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
@@ -568,61 +558,18 @@ export class AgentRuntime {
 
     if (this.currentTypingUserId) {
       try {
-        await this.wechatClient.sendTypingIndicator(this.currentTypingUserId, "cancel");
+        await this.sendWechatTypingIndicator(
+          this.currentTypingUserId,
+          "cancel",
+          this.currentTypingContextToken || undefined,
+        );
       } catch {
         // Ignore typing cancel failures during shutdown.
       }
     }
 
     this.currentTypingUserId = null;
-  }
-
-  private async trySendStartupReadyMessage(): Promise<void> {
-    const notice = this.pendingStartupReadyNotice;
-    if (!notice) {
-      return;
-    }
-
-    const targetUserId = this.resolveStartupReadyRecipient(notice.botId, notice.fallbackUserId);
-    if (!targetUserId) {
-      this.pushEvent("warn", "Agent started, but no WeChat conversation target was available for the startup ready message.");
-      this.pendingStartupReadyNotice = null;
-      return;
-    }
-
-    notice.attempts += 1;
-    try {
-      await this.wechatClient.sendText(targetUserId, "连接微信成功，你现在可以通过聊天窗口与我对话了");
-      this.pushEvent("info", `Startup ready message sent to ${targetUserId}.`);
-      this.pendingStartupReadyNotice = null;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (notice.attempts >= 3) {
-        this.pushEvent("warn", `Agent started, but failed to send startup ready message: ${message}`);
-        this.pendingStartupReadyNotice = null;
-        return;
-      }
-      this.pushEvent("warn", `Startup ready message attempt ${notice.attempts} failed, will retry: ${message}`);
-    }
-  }
-
-  private resolveStartupReadyRecipient(botId: string, fallbackUserId: string | null | undefined): string | null {
-    const contextTokens = this.store.loadState().contextTokens;
-    const prefix = `${botId}:`;
-    const contextUsers = Object.keys(contextTokens)
-      .filter((key) => key.startsWith(prefix) && Boolean(contextTokens[key]))
-      .map((key) => key.slice(prefix.length))
-      .filter(Boolean);
-
-    if (fallbackUserId && contextUsers.includes(fallbackUserId)) {
-      return fallbackUserId;
-    }
-
-    if (contextUsers.length > 0) {
-      return contextUsers[contextUsers.length - 1];
-    }
-
-    return fallbackUserId || null;
+    this.currentTypingContextToken = null;
   }
 
   private shouldDeferForMedia(message: InboundMessage): boolean {
@@ -655,7 +602,11 @@ export class AgentRuntime {
     try {
       const pendingCount = this.appendPendingMedia(message);
       const pendingMessages = this.peekPendingMedia(message.fromUserId) || [message];
-      await this.wechatClient.sendText(message.fromUserId, this.buildMediaReceiptText(this.collectDeferredMedia(pendingMessages)));
+      await this.sendWechatText(
+        message.fromUserId,
+        this.buildMediaReceiptText(this.collectDeferredMedia(pendingMessages)),
+        message.contextToken,
+      );
       this.pushEvent(
         "info",
         `Deferred ${this.describeDeferredMedia(message)} from ${message.fromUserId}; waiting for text follow-up (${pendingCount} pending).`,
@@ -1069,26 +1020,75 @@ export class AgentRuntime {
     userId: string,
     chunk: { visibleText: string; filePaths: string[] },
     eventPrefix: string,
+    contextToken?: string,
   ): Promise<void> {
-    if (chunk.visibleText) {
-      await this.wechatClient.sendText(userId, chunk.visibleText);
-      this.pushEvent("info", `${eventPrefix} to ${userId}: ${this.compactText(chunk.visibleText)}`);
+    for (const textPart of splitWechatReplyText(chunk.visibleText)) {
+      await this.sendWechatText(userId, textPart, contextToken);
+      this.pushEvent("info", `${eventPrefix} to ${userId}: ${this.compactText(textPart)}`);
     }
 
     for (const filePath of chunk.filePaths) {
       try {
-        await this.wechatClient.sendLocalFile(userId, filePath);
+        await this.sendWechatFile(userId, filePath, contextToken);
         this.pushEvent("info", `Sent local file back to ${userId}: ${filePath}`);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         this.pushEvent("error", `Failed to send local file to ${userId}: ${message}`);
         try {
-          await this.wechatClient.sendText(userId, `文件回传失败：${message}`);
+          await this.sendWechatText(userId, `文件回传失败：${message}`, contextToken);
         } catch {
           // Ignore secondary delivery failures; the event log already captured the root cause.
         }
       }
     }
+  }
+
+  private async sendWechatText(userId: string, text: string, contextToken?: string): Promise<void> {
+    if (contextToken) {
+      await this.wechatClient.sendText(userId, text, contextToken);
+      return;
+    }
+
+    await this.wechatClient.sendText(userId, text);
+  }
+
+  private async sendWechatTypingIndicator(
+    userId: string,
+    status: "typing" | "cancel",
+    contextToken?: string,
+  ): Promise<void> {
+    if (contextToken) {
+      await this.wechatClient.sendTypingIndicator(userId, status, contextToken);
+      return;
+    }
+
+    await this.wechatClient.sendTypingIndicator(userId, status);
+  }
+
+  private async sendWechatFile(userId: string, filePath: string, contextToken?: string): Promise<void> {
+    if (contextToken) {
+      await this.wechatClient.sendLocalFile(userId, filePath, contextToken);
+      return;
+    }
+
+    await this.wechatClient.sendLocalFile(userId, filePath);
+  }
+
+  private appendWechatReplyText(buffer: string, chunk: string): string {
+    const normalizedChunk = chunk.trim();
+    if (!normalizedChunk) {
+      return buffer;
+    }
+
+    if (!buffer) {
+      return normalizedChunk;
+    }
+
+    if (buffer.endsWith("\n") || normalizedChunk.startsWith("\n")) {
+      return `${buffer}${normalizedChunk}`;
+    }
+
+    return `${buffer}\n${normalizedChunk}`;
   }
 
   private compactText(text: string): string {

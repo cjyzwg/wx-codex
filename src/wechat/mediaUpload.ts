@@ -33,6 +33,10 @@ type UploadedFileInfo = {
   fileSizeCiphertext: number;
 };
 
+function encodeWechatMediaAesKey(aesKeyHex: string): string {
+  return Buffer.from(aesKeyHex, "ascii").toString("base64");
+}
+
 function encryptAesEcb(plaintext: Buffer, key: Buffer): Buffer {
   const cipher = createCipheriv("aes-128-ecb", key, null);
   return Buffer.concat([cipher.update(plaintext), cipher.final()]);
@@ -155,7 +159,7 @@ function buildImageItem(uploaded: UploadedFileInfo): MessageItem {
   const imageItem: ImageItem = {
     media: {
       encrypt_query_param: uploaded.downloadEncryptedQueryParam,
-      aes_key: Buffer.from(uploaded.aesKeyHex, "hex").toString("base64"),
+      aes_key: encodeWechatMediaAesKey(uploaded.aesKeyHex),
       encrypt_type: 1,
     },
     mid_size: uploaded.fileSizeCiphertext,
@@ -171,7 +175,7 @@ function buildVideoItem(uploaded: UploadedFileInfo): MessageItem {
   const videoItem: VideoItem = {
     media: {
       encrypt_query_param: uploaded.downloadEncryptedQueryParam,
-      aes_key: Buffer.from(uploaded.aesKeyHex, "hex").toString("base64"),
+      aes_key: encodeWechatMediaAesKey(uploaded.aesKeyHex),
       encrypt_type: 1,
     },
     video_size: uploaded.fileSizeCiphertext,
@@ -187,7 +191,7 @@ function buildFileItem(fileName: string, uploaded: UploadedFileInfo): MessageIte
   const fileItem: FileItem = {
     media: {
       encrypt_query_param: uploaded.downloadEncryptedQueryParam,
-      aes_key: Buffer.from(uploaded.aesKeyHex, "hex").toString("base64"),
+      aes_key: encodeWechatMediaAesKey(uploaded.aesKeyHex),
       encrypt_type: 1,
     },
     file_name: fileName,

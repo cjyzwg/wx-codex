@@ -34,6 +34,28 @@ function buildBaseInfo(): { channel_version: string } {
   return { channel_version: CHANNEL_VERSION };
 }
 
+function assertBusinessSuccess(rawText: string, label: string): void {
+  const trimmed = rawText.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as { ret?: number; errcode?: number; errmsg?: string };
+    if (typeof parsed.errcode === "number" && parsed.errcode !== 0) {
+      throw new Error(`${label} business error: ${parsed.errmsg || `errcode=${parsed.errcode}`}`);
+    }
+    if (typeof parsed.ret === "number" && parsed.ret !== 0) {
+      throw new Error(`${label} business error: ${parsed.errmsg || `ret=${parsed.ret}`}`);
+    }
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      return;
+    }
+    throw error;
+  }
+}
+
 async function apiFetch(params: {
   baseUrl: string;
   endpoint: string;
@@ -103,7 +125,7 @@ export async function sendMessage(params: {
   token?: string;
   body: SendMessageReq;
 }): Promise<void> {
-  await apiFetch({
+  const raw = await apiFetch({
     baseUrl: params.baseUrl,
     endpoint: "ilink/bot/sendmessage",
     body: JSON.stringify({ ...params.body, base_info: buildBaseInfo() }),
@@ -111,6 +133,7 @@ export async function sendMessage(params: {
     timeoutMs: DEFAULT_API_TIMEOUT_MS,
     label: "sendMessage",
   });
+  assertBusinessSuccess(raw, "sendMessage");
 }
 
 export async function getUploadUrl(params: {
@@ -213,7 +236,7 @@ export async function sendTyping(params: {
   token?: string;
   body: SendTypingReq;
 }): Promise<void> {
-  await apiFetch({
+  const raw = await apiFetch({
     baseUrl: params.baseUrl,
     endpoint: "ilink/bot/sendtyping",
     body: JSON.stringify({ ...params.body, base_info: buildBaseInfo() }),
@@ -221,6 +244,7 @@ export async function sendTyping(params: {
     timeoutMs: DEFAULT_API_TIMEOUT_MS,
     label: "sendTyping",
   });
+  assertBusinessSuccess(raw, "sendTyping");
 }
 
 export function generateId(prefix: string): string {

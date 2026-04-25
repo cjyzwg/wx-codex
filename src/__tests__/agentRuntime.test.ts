@@ -259,7 +259,7 @@ describe("AgentRuntime", () => {
     expect(store.loadState().threadSessions["bot-id:user-stale"]?.activeThreadId).toBe("thread-stale");
   });
 
-  it("auto starts when login state exists and sends a ready message", async () => {
+  it("auto starts when login state exists without sending a proactive WeChat ready message", async () => {
     const store = new MemoryStore();
     saveAccount(store);
 
@@ -276,12 +276,12 @@ describe("AgentRuntime", () => {
     await runtime.autoStartIfPossible();
 
     expect(codexBridge.connect).toHaveBeenCalledTimes(1);
-    expect(wechatClient.sendText).toHaveBeenCalledWith("self-id", "连接微信成功，你现在可以通过聊天窗口与我对话了");
+    expect(wechatClient.sendText).not.toHaveBeenCalled();
     expect(runtime.getSnapshot().agent.status).toBe("running");
     await runtime.stop();
   });
 
-  it("prefers an existing context-token user when sending the startup ready message", async () => {
+  it("does not attempt a startup ready message even when cached context tokens exist", async () => {
     const store = new MemoryStore();
     saveAccount(store);
     const state = store.loadState();
@@ -301,7 +301,7 @@ describe("AgentRuntime", () => {
     await runtime.initialize();
     await runtime.autoStartIfPossible();
 
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-y", "连接微信成功，你现在可以通过聊天窗口与我对话了");
+    expect(wechatClient.sendText).not.toHaveBeenCalled();
     await runtime.stop();
   });
 
@@ -598,16 +598,17 @@ describe("AgentRuntime", () => {
     expect(turns[0]).not.toContain("[Image saved:");
   });
 
-  it("streams codex agent text to WeChat instead of only sending the final line", async () => {
+  it("buffers codex streamed text and sends one combined WeChat reply when the turn completes", async () => {
     const store = new MemoryStore();
     saveAccount(store);
 
     const wechatClient = createWechatClient(store);
     const codexBridge = createCodexBridge({
-      runTurn: vi.fn(async (_prompt: string, options?: { onText?: (text: string) => Promise<void> | void }) => {
-        await options?.onText?.("第一句");
-        await options?.onText?.("第二句");
-        return { replyText: "第二句", streamedAny: true, finalAlreadyStreamed: true };
+      runTurn: vi.fn(async (_prompt: string, options?: { onText?: (text: string, meta?: { isFinal: boolean }) => Promise<void> | void }) => {
+        for (let index = 1; index <= 12; index += 1) {
+          await options?.onText?.(`第${index}句。`, { isFinal: index === 12 });
+        }
+        return { replyText: "第12句。", streamedAny: true, finalAlreadyStreamed: true };
       }),
     });
 
@@ -624,9 +625,11 @@ describe("AgentRuntime", () => {
       text: "你好",
     }));
 
-    expect(wechatClient.sendText).toHaveBeenCalledTimes(2);
-    expect(wechatClient.sendText).toHaveBeenNthCalledWith(1, "user-d", "第一句");
-    expect(wechatClient.sendText).toHaveBeenNthCalledWith(2, "user-d", "第二句");
+    expect(wechatClient.sendText).toHaveBeenCalledTimes(1);
+    expect(wechatClient.sendText).toHaveBeenCalledWith(
+      "user-d",
+      "第1句。\n第2句。\n第3句。\n第4句。\n第5句。\n第6句。\n第7句。\n第8句。\n第9句。\n第10句。\n第11句。\n第12句。",
+    );
   });
 
   it("keeps a multiline streamed paragraph in one WeChat message", async () => {
@@ -658,6 +661,37 @@ describe("AgentRuntime", () => {
     expect(wechatClient.sendText).toHaveBeenCalledWith("user-e", "当前这个项目根目录下主要有这些目录：\n- dist\n- happy\n- src");
   });
 
+  it("splits an overlong final reply into a few natural WeChat messages", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+
+    const wechatClient = createWechatClient(store);
+    const longReply = Array.from({ length: 90 }, (_value, index) => `第${index + 1}段说明。`).join("\n");
+    const codexBridge = createCodexBridge({
+      runTurn: vi.fn(async (_prompt: string, options?: { onText?: (text: string, meta?: { isFinal: boolean }) => Promise<void> | void }) => {
+        await options?.onText?.(longReply, { isFinal: true });
+        return { replyText: longReply, streamedAny: true, finalAlreadyStreamed: true };
+      }),
+    });
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: codexBridge as never,
+    });
+
+    await runtime.initialize();
+    await getHandleSingleMessage(runtime)(message({
+      messageId: 6,
+      fromUserId: "user-split",
+      text: "给我长回复",
+    }));
+
+    expect(wechatClient.sendText.mock.calls.length).toBeGreaterThan(1);
+    expect(wechatClient.sendText.mock.calls.length).toBeLessThan(10);
+    expect(wechatClient.sendText.mock.calls.every((call) => typeof call[1] === "string" && call[1].length <= 500)).toBe(true);
+  });
+
   it("sends local files back to WeChat when codex emits wx_send markers", async () => {
     const store = new MemoryStore();
     saveAccount(store);
@@ -686,5 +720,36 @@ describe("AgentRuntime", () => {
     expect(wechatClient.sendText).toHaveBeenCalledWith("user-f", "分析完成。");
     expect(wechatClient.sendLocalFile).toHaveBeenCalledWith("user-f", "/tmp/report.txt");
     expect(wechatClient.sendText).not.toHaveBeenCalledWith("user-f", expect.stringContaining("[[wx_send:"));
+  });
+
+  it("uses the current inbound message context token instead of the latest cached token when replying", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+
+    const state = store.loadState();
+    state.contextTokens["bot-id:user-g"] = "ctx-latest-cached";
+    store.saveState(state);
+
+    const wechatClient = createWechatClient(store);
+    const codexBridge = createCodexBridge({
+      runTurn: vi.fn(async () => ({ replyText: "当前这条消息的回复", streamedAny: false, finalAlreadyStreamed: false })),
+    });
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: codexBridge as never,
+    });
+
+    await runtime.initialize();
+    await getHandleSingleMessage(runtime)(message({
+      messageId: 8,
+      fromUserId: "user-g",
+      text: "排队消息",
+      contextToken: "ctx-current-turn",
+    }));
+
+    expect(wechatClient.sendTypingIndicator).toHaveBeenCalledWith("user-g", "typing", "ctx-current-turn");
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-g", "当前这条消息的回复", "ctx-current-turn");
   });
 });

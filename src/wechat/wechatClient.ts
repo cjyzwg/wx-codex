@@ -153,7 +153,7 @@ export class WechatClient {
     }
 
     const newMessages = (response.msgs || []).filter(
-      (message) => message.message_type === MessageType.USER && (message.message_id || 0) > nextState.lastMessageId,
+      (message) => message.message_type === MessageType.USER,
     );
 
     if (newMessages.length > 0) {
@@ -170,10 +170,9 @@ export class WechatClient {
     return Promise.all(newMessages.map((message) => this.formatMessage(message)));
   }
 
-  async sendText(to: string, text: string): Promise<void> {
+  async sendText(to: string, text: string, contextTokenOverride?: string): Promise<void> {
     const account = this.requireAccount();
-    const state = this.store.loadState();
-    const contextToken = state.contextTokens[`${account.botId}:${to}`];
+    const contextToken = this.resolveContextToken(account.botId, to, contextTokenOverride);
 
     await sendMessage({
       baseUrl: account.baseUrl,
@@ -192,10 +191,9 @@ export class WechatClient {
     });
   }
 
-  async sendTypingIndicator(to: string, status: "typing" | "cancel"): Promise<void> {
+  async sendTypingIndicator(to: string, status: "typing" | "cancel", contextTokenOverride?: string): Promise<void> {
     const account = this.requireAccount();
-    const state = this.store.loadState();
-    const contextToken = state.contextTokens[`${account.botId}:${to}`];
+    const contextToken = this.resolveContextToken(account.botId, to, contextTokenOverride);
     if (!contextToken) {
       throw new Error(`No WeChat conversation context found for user ${to}.`);
     }
@@ -222,7 +220,7 @@ export class WechatClient {
     });
   }
 
-  async sendLocalFile(to: string, filePath: string): Promise<void> {
+  async sendLocalFile(to: string, filePath: string, contextTokenOverride?: string): Promise<void> {
     const account = this.requireAccount();
     if (!path.isAbsolute(filePath)) {
       throw new Error(`WeChat file send only supports absolute paths: ${filePath}`);
@@ -233,8 +231,7 @@ export class WechatClient {
       throw new Error(`WeChat file send target does not exist: ${resolvedPath}`);
     }
 
-    const state = this.store.loadState();
-    const contextToken = state.contextTokens[`${account.botId}:${to}`];
+    const contextToken = this.resolveContextToken(account.botId, to, contextTokenOverride);
     if (!contextToken) {
       throw new Error(`No WeChat conversation context found for user ${to}.`);
     }
@@ -254,6 +251,15 @@ export class WechatClient {
       throw new Error("WeChat is not logged in.");
     }
     return account;
+  }
+
+  private resolveContextToken(botId: string, to: string, contextTokenOverride?: string): string | undefined {
+    if (contextTokenOverride?.trim()) {
+      return contextTokenOverride.trim();
+    }
+
+    const state = this.store.loadState();
+    return state.contextTokens[`${botId}:${to}`];
   }
 
   private async writeQrArtifacts(url: string): Promise<string> {
