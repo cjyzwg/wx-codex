@@ -465,6 +465,34 @@ describe("AgentRuntime", () => {
     expect((runtime.getSnapshot().codex as { threadCwd?: string | null }).threadCwd).toBe("unknown (external thread)");
   });
 
+  it("attaches an external codex thread with a manually assigned cwd from /use --cwd", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+
+    const wechatClient = createWechatClient(store);
+    const codexBridge = createCodexBridge({
+      activateThread: vi.fn(async (threadId: string) => threadId),
+    });
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: codexBridge as never,
+    });
+
+    await runtime.initialize();
+    await getHandleSingleMessage(runtime)(message({ text: "/use external-thread-xyz --cwd /repo/external" }));
+
+    const thread = store.loadState().threadSessions["bot-id:user-a"]?.threads[0] as {
+      displayCwd?: string | null;
+      cwdSource?: string;
+    };
+    expect(thread?.displayCwd).toBe("/repo/external");
+    expect(thread?.cwdSource).toBe("attached_external");
+    expect((runtime.getSnapshot().codex as { threadCwd?: string | null }).threadCwd).toBe("/repo/external");
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("cwd: /repo/external"));
+  });
+
   it("exposes the active thread cwd in the codex snapshot for the tui", async () => {
     const store = new MemoryStore();
     saveAccount(store);
@@ -488,6 +516,29 @@ describe("AgentRuntime", () => {
 
     expect(runtime.getSnapshot().codex.threadId).toBe("thread-2");
     expect((runtime.getSnapshot().codex as { threadCwd?: string | null }).threadCwd).toBe("unknown (external thread)");
+  });
+
+  it("lists a manually assigned cwd for an attached external thread in /threads", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+    setThreadSession(
+      store,
+      "user-a",
+      [{ threadId: "external-thread-xyz", createdAt: 1, lastUsedAt: 1, displayCwd: "/repo/external", cwdSource: "attached_external" }],
+      "external-thread-xyz",
+    );
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: createWechatClient(store) as never,
+      codexBridge: createCodexBridge() as never,
+    });
+
+    await runtime.initialize();
+    await getHandleSingleMessage(runtime)(message({ text: "/threads" }));
+
+    const wechatClient = runtime as unknown as { wechatClient: { sendText: ReturnType<typeof vi.fn> } };
+    expect(wechatClient.wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("cwd: /repo/external"));
   });
 
   it("replies directly for unsupported message types without calling codex", async () => {

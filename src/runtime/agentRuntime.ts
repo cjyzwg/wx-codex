@@ -38,7 +38,7 @@ type StartOptions = {
 type ThreadCommand =
   | { type: "new" }
   | { type: "list" }
-  | { type: "use"; target: string };
+  | { type: "use"; target: string; displayCwd?: string | null };
 
 type ThreadSelectionResult =
   | { status: "selected"; threadId: string }
@@ -468,7 +468,16 @@ export class AgentRuntime {
     }
     const useMatch = normalized.match(/^\/use\s+(.+)$/);
     if (useMatch) {
-      return { type: "use", target: useMatch[1].trim() };
+      const rawArgs = useMatch[1].trim();
+      const cwdMatch = rawArgs.match(/^(.*?)\s+--cwd\s+(.+)$/);
+      if (cwdMatch) {
+        return {
+          type: "use",
+          target: cwdMatch[1].trim(),
+          displayCwd: cwdMatch[2].trim() || null,
+        };
+      }
+      return { type: "use", target: rawArgs };
     }
     return null;
   }
@@ -506,12 +515,16 @@ export class AgentRuntime {
         try {
           const externalThreadId = await this.codexBridge.activateThread(command.target);
           this.markThreadActive(session, externalThreadId, Date.now(), {
-            displayCwd: null,
+            displayCwd: command.displayCwd ?? null,
             cwdSource: "attached_external",
           });
           this.persistThreadSession(state, message.fromUserId, session);
           this.setSnapshotThread(externalThreadId, state);
-          await this.sendWechatText(message.fromUserId, `已接入外部会话：${externalThreadId}`, message.contextToken);
+          await this.sendWechatText(
+            message.fromUserId,
+            `已接入外部会话：${externalThreadId}${command.displayCwd ? ` | cwd: ${command.displayCwd}` : ""}`,
+            message.contextToken,
+          );
           this.pushEvent("info", `Attached external Codex thread for ${message.fromUserId}: ${externalThreadId}.`);
           return;
         } catch {
@@ -532,10 +545,24 @@ export class AgentRuntime {
         return;
       }
 
-      this.markThreadActive(session, selected.threadId, Date.now());
+      this.markThreadActive(
+        session,
+        selected.threadId,
+        Date.now(),
+        command.displayCwd
+          ? {
+              displayCwd: command.displayCwd,
+              cwdSource: session.threads.find((thread) => thread.threadId === selected.threadId)?.cwdSource ?? "unknown",
+            }
+          : undefined,
+      );
       this.persistThreadSession(state, message.fromUserId, session);
       this.setSnapshotThread(selected.threadId, state);
-      await this.sendWechatText(message.fromUserId, `已切换到会话：${selected.threadId}`, message.contextToken);
+      await this.sendWechatText(
+        message.fromUserId,
+        `已切换到会话：${selected.threadId}${command.displayCwd ? ` | cwd: ${command.displayCwd}` : ""}`,
+        message.contextToken,
+      );
       this.pushEvent("info", `Switched ${message.fromUserId} to Codex thread ${selected.threadId}.`);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
