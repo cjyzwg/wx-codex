@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { AppConfig } from "../config.js";
-import type { AgentStatus, CodexCardState, CodexStatus, InboundMedia, InboundMessage, RuntimeEvent, RuntimeSnapshot, WechatCardState } from "../types.js";
+import type { AgentStatus, CodexCardState, CodexStatus, InboundMedia, InboundMessage, RuntimeEvent, RuntimeSnapshot, RuntimeState, UserThreadSession, WechatCardState } from "../types.js";
 import { WechatStore } from "../store/wechatStore.js";
 import { CodexBridge } from "../codex/codexBridge.js";
 import { WechatClient } from "../wechat/wechatClient.js";
@@ -27,6 +27,11 @@ type PendingStartupReadyNotice = {
   fallbackUserId: string | null;
   attempts: number;
 };
+
+type ThreadCommand =
+  | { type: "new" }
+  | { type: "list" }
+  | { type: "use"; target: string };
 
 export class AgentRuntime {
   private readonly listeners = new Set<Listener>();
@@ -148,15 +153,13 @@ export class AgentRuntime {
     this.pushEvent("info", `Starting agent for WeChat bot ${account.botId}.`);
 
     try {
-      const storedState = this.store.loadState();
-      const threadId = await this.codexBridge.ensureSharedThread(storedState.sharedThreadId);
+      await this.codexBridge.connect();
       const nextState = this.store.loadState();
-      nextState.sharedThreadId = threadId;
       nextState.codexStatus = "idle";
       nextState.agentStatus = "running";
       nextState.lastError = null;
       this.store.saveState(nextState);
-      this.snapshot.codex.threadId = threadId;
+      this.snapshot.codex.threadId = this.findMostRecentThreadId(nextState);
       this.snapshot.codex.status = "idle";
       this.snapshot.codex.lastConnectedAt = Date.now();
       this.publish();
@@ -257,18 +260,16 @@ export class AgentRuntime {
   }
 
   async reconnectCodex(): Promise<void> {
-    const state = this.store.loadState();
     try {
-      const threadId = await this.codexBridge.reconnect(state.sharedThreadId);
+      const threadId = await this.codexBridge.reconnect(this.snapshot.codex.threadId);
       this.snapshot.codex.status = "idle";
       this.snapshot.codex.threadId = threadId;
       this.snapshot.codex.lastConnectedAt = Date.now();
       const nextState = this.store.loadState();
-      nextState.sharedThreadId = threadId;
       nextState.codexStatus = "idle";
       nextState.lastError = null;
       this.store.saveState(nextState);
-      this.pushEvent("info", threadId ? "Codex reconnected and resumed the shared thread." : "Codex reconnected.");
+      this.pushEvent("info", threadId ? "Codex reconnected and resumed the active thread." : "Codex reconnected.");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.snapshot.codex.status = "error";
@@ -365,6 +366,12 @@ export class AgentRuntime {
   }
 
   private async handleSingleMessage(message: InboundMessage): Promise<void> {
+    const threadCommand = this.parseThreadCommand(message.text);
+    if (threadCommand) {
+      await this.handleThreadCommand(message, threadCommand);
+      return;
+    }
+
     if (message.directReplyText) {
       try {
         await this.wechatClient.sendText(message.fromUserId, message.directReplyText);
@@ -395,10 +402,12 @@ export class AgentRuntime {
       return;
     }
 
+    const threadId = await this.ensureMessageThread(message.fromUserId);
     const formattedPrompt = this.buildPrompt(message, pendingMedia);
     if (pendingMedia) {
       this.clearPendingMedia(message.fromUserId);
     }
+    this.snapshot.codex.threadId = threadId;
     this.pushEvent("info", `Codex is handling a turn for ${message.fromUserId}.`);
 
     try {
@@ -435,6 +444,71 @@ export class AgentRuntime {
       this.pushEvent("error", `Failed to handle message for ${message.fromUserId}: ${messageText}`);
     } finally {
       await this.cancelTyping();
+      if (this.snapshot.agent.status !== "stopped") {
+        this.snapshot.agent.status = this.running ? "running" : "stopped";
+      }
+      this.publish();
+    }
+  }
+
+  private parseThreadCommand(text: string): ThreadCommand | null {
+    const normalized = text.trim();
+    if (normalized === "/new") {
+      return { type: "new" };
+    }
+    if (normalized === "/threads") {
+      return { type: "list" };
+    }
+    const useMatch = normalized.match(/^\/use\s+(.+)$/);
+    if (useMatch) {
+      return { type: "use", target: useMatch[1].trim() };
+    }
+    return null;
+  }
+
+  private async handleThreadCommand(message: InboundMessage, command: ThreadCommand): Promise<void> {
+    try {
+      if (command.type === "new") {
+        const threadId = await this.createNewThreadForUser(message.fromUserId);
+        await this.wechatClient.sendText(message.fromUserId, `已切换到新会话：${threadId}`);
+        this.pushEvent("info", `Created a new Codex thread for ${message.fromUserId}: ${threadId}`);
+        return;
+      }
+
+      const state = this.store.loadState();
+      const session = this.getOrCreateThreadSession(state, message.fromUserId);
+
+      if (command.type === "list") {
+        if (session.threads.length === 0) {
+          await this.wechatClient.sendText(message.fromUserId, "当前还没有会话，直接发消息或输入 /new 创建一个新会话。");
+          return;
+        }
+
+        const lines = ["当前会话列表："];
+        session.threads.forEach((thread, index) => {
+          lines.push(`${index + 1}. ${thread.threadId}${thread.threadId === session.activeThreadId ? " (当前)" : ""}`);
+        });
+        await this.wechatClient.sendText(message.fromUserId, lines.join("\n"));
+        return;
+      }
+
+      const selected = this.resolveThreadSelection(session, command.target);
+      if (!selected) {
+        await this.wechatClient.sendText(message.fromUserId, "没有找到对应会话，请使用 /threads 查看可切换的会话编号。");
+        return;
+      }
+
+      this.markThreadActive(session, selected.threadId, Date.now());
+      this.persistThreadSession(state, message.fromUserId, session);
+      this.snapshot.codex.threadId = selected.threadId;
+      await this.wechatClient.sendText(message.fromUserId, `已切换到会话：${selected.threadId}`);
+      this.pushEvent("info", `Switched ${message.fromUserId} to Codex thread ${selected.threadId}.`);
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : String(error);
+      this.snapshot.agent.status = "error";
+      this.persistRuntimeState(this.snapshot.codex.status, "error", messageText);
+      this.pushEvent("error", `Failed to handle thread command for ${message.fromUserId}: ${messageText}`);
+    } finally {
       if (this.snapshot.agent.status !== "stopped") {
         this.snapshot.agent.status = this.running ? "running" : "stopped";
       }
@@ -702,7 +776,7 @@ export class AgentRuntime {
       available: false,
       version: null,
       status: runtimeState.codexStatus,
-      threadId: runtimeState.sharedThreadId,
+      threadId: this.findMostRecentThreadId(runtimeState),
       lastConnectedAt: null,
       lastError: runtimeState.lastError,
     };
@@ -726,6 +800,130 @@ export class AgentRuntime {
     nextState.agentStatus = agentStatus;
     nextState.lastError = lastError;
     this.store.saveState(nextState);
+  }
+
+  private async ensureMessageThread(userId: string): Promise<string> {
+    const state = this.store.loadState();
+    const session = this.getOrCreateThreadSession(state, userId);
+    const requestedThreadId = session.activeThreadId;
+    const resolvedThreadId = await this.codexBridge.ensureThread(requestedThreadId);
+    const now = Date.now();
+
+    if (requestedThreadId && requestedThreadId !== resolvedThreadId) {
+      this.pushEvent("warn", `Failed to resume thread ${requestedThreadId} for ${userId}; switched to ${resolvedThreadId}.`);
+    }
+
+    this.markThreadActive(session, resolvedThreadId, now);
+    this.persistThreadSession(state, userId, session);
+    this.snapshot.codex.threadId = resolvedThreadId;
+    this.snapshot.codex.lastConnectedAt = now;
+    return resolvedThreadId;
+  }
+
+  private async createNewThreadForUser(userId: string): Promise<string> {
+    const state = this.store.loadState();
+    const session = this.getOrCreateThreadSession(state, userId);
+    const threadId = await this.codexBridge.createThread();
+    this.markThreadActive(session, threadId, Date.now());
+    this.persistThreadSession(state, userId, session);
+    this.snapshot.codex.threadId = threadId;
+    this.snapshot.codex.lastConnectedAt = Date.now();
+    return threadId;
+  }
+
+  private getOrCreateThreadSession(state: RuntimeState, userId: string): UserThreadSession {
+    const key = this.getThreadSessionKey(userId);
+    const existing = state.threadSessions[key];
+    if (existing) {
+      return existing;
+    }
+
+    if (state.legacySharedThreadId) {
+      const migratedAt = Date.now();
+      const migrated: UserThreadSession = {
+        activeThreadId: state.legacySharedThreadId,
+        lastUsedAt: migratedAt,
+        threads: [
+          {
+            threadId: state.legacySharedThreadId,
+            createdAt: migratedAt,
+            lastUsedAt: migratedAt,
+          },
+        ],
+      };
+      state.threadSessions[key] = migrated;
+      state.legacySharedThreadId = null;
+      return migrated;
+    }
+
+    const created: UserThreadSession = {
+      activeThreadId: null,
+      lastUsedAt: null,
+      threads: [],
+    };
+    state.threadSessions[key] = created;
+    return created;
+  }
+
+  private persistThreadSession(state: RuntimeState, userId: string, session: UserThreadSession): void {
+    state.threadSessions[this.getThreadSessionKey(userId)] = session;
+    state.legacySharedThreadId = null;
+    this.store.saveState(state);
+  }
+
+  private getThreadSessionKey(userId: string): string {
+    const account = this.wechatClient.getAccount();
+    if (!account) {
+      throw new Error("WeChat is not logged in.");
+    }
+    return `${account.botId}:${userId}`;
+  }
+
+  private markThreadActive(session: UserThreadSession, threadId: string, timestamp: number): void {
+    const existing = session.threads.find((thread) => thread.threadId === threadId);
+    if (existing) {
+      existing.lastUsedAt = timestamp;
+    } else {
+      session.threads.push({
+        threadId,
+        createdAt: timestamp,
+        lastUsedAt: timestamp,
+      });
+    }
+    session.activeThreadId = threadId;
+    session.lastUsedAt = timestamp;
+  }
+
+  private resolveThreadSelection(session: UserThreadSession, target: string): { threadId: string } | null {
+    const numericIndex = Number.parseInt(target, 10);
+    if (Number.isInteger(numericIndex) && String(numericIndex) === target) {
+      return session.threads[numericIndex - 1] || null;
+    }
+
+    const matches = session.threads.filter((thread) => thread.threadId.startsWith(target));
+    if (matches.length !== 1) {
+      return null;
+    }
+    return matches[0];
+  }
+
+  private findMostRecentThreadId(state: RuntimeState): string | null {
+    let latestThreadId = state.legacySharedThreadId || null;
+    let latestTimestamp = -1;
+
+    for (const session of Object.values(state.threadSessions)) {
+      if (!session.activeThreadId) {
+        continue;
+      }
+      const activeThread = session.threads.find((thread) => thread.threadId === session.activeThreadId);
+      const timestamp = activeThread?.lastUsedAt ?? session.lastUsedAt ?? -1;
+      if (timestamp >= latestTimestamp) {
+        latestThreadId = session.activeThreadId;
+        latestTimestamp = timestamp;
+      }
+    }
+
+    return latestThreadId;
   }
 
   private compactText(text: string): string {

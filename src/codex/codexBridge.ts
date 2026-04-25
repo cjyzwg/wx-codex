@@ -180,8 +180,12 @@ export class CodexBridge {
     this.setStatus("disconnected");
   }
 
-  async ensureSharedThread(sharedThreadId: string | null): Promise<string> {
+  async ensureThread(sharedThreadId: string | null): Promise<string> {
     await this.connect();
+    if (sharedThreadId && this.threadId === sharedThreadId) {
+      return sharedThreadId;
+    }
+
     if (sharedThreadId) {
       try {
         const resumed = await this.resumeThread(sharedThreadId);
@@ -193,6 +197,12 @@ export class CodexBridge {
       }
     }
 
+    const started = await this.startThread();
+    return started.threadId;
+  }
+
+  async createThread(): Promise<string> {
+    await this.connect();
     const started = await this.startThread();
     return started.threadId;
   }
