@@ -303,7 +303,7 @@ export class CodexBridge {
       threadId,
       model: this.model || null,
       modelProvider: null,
-      cwd: process.cwd(),
+      cwd: null,
       approvalPolicy: "on-failure",
       sandbox: "danger-full-access",
       config: null,
@@ -324,7 +324,7 @@ export class CodexBridge {
     const params: Record<string, unknown> = {
       threadId: this.threadId,
       input: [{ type: "text", text: prompt }],
-      cwd: process.cwd(),
+      cwd: null,
       approvalPolicy: "on-failure",
       sandboxPolicy: { type: "dangerFullAccess" },
     };
