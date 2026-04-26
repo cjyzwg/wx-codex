@@ -21,6 +21,52 @@ afterEach(() => {
 });
 
 describe("WechatStore", () => {
+  it("migrates a legacy single-account file into the multi-account list", () => {
+    const store = createStore();
+    const accountPath = path.join(store.getDataDir(), "account.json");
+    fs.writeFileSync(
+      accountPath,
+      JSON.stringify({
+        botToken: "token-a",
+        botId: "bot-a",
+        userId: "self-a",
+        baseUrl: "https://example.com",
+        savedAt: 123,
+      }),
+      "utf8",
+    );
+
+    const accounts = store.loadAccounts();
+
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]?.botId).toBe("bot-a");
+    expect(store.loadAccount("bot-a")?.userId).toBe("self-a");
+  });
+
+  it("upserts multiple accounts without dropping existing bots", () => {
+    const store = createStore();
+
+    store.saveAccount({
+      botToken: "token-a",
+      botId: "bot-a",
+      userId: "self-a",
+      baseUrl: "https://example.com",
+      savedAt: 1,
+    });
+    store.saveAccount({
+      botToken: "token-b",
+      botId: "bot-b",
+      userId: "self-b",
+      baseUrl: "https://example.com",
+      savedAt: 2,
+    });
+
+    const accounts = store.loadAccounts();
+
+    expect(accounts.map((account) => account.botId)).toEqual(["bot-a", "bot-b"]);
+    expect(store.loadAccount("bot-b")?.userId).toBe("self-b");
+  });
+
   it("initializes per-user thread session defaults", () => {
     const store = createStore();
 

@@ -12,6 +12,12 @@ export interface AccountData {
   userId: string;
   baseUrl: string;
   savedAt: number;
+  label?: string;
+}
+
+export interface StoredAccountsData {
+  activeBotId: string | null;
+  accounts: AccountData[];
 }
 
 export interface QrLoginState {
@@ -36,8 +42,10 @@ export interface UserThreadSession {
 
 export interface RuntimeState {
   updatesBuf: string;
+  updatesBufByBot?: Record<string, string>;
   contextTokens: Record<string, string>;
   lastMessageId: number;
+  lastMessageIdByBot?: Record<string, number>;
   threadSessions: Record<string, UserThreadSession>;
   legacySharedThreadId?: string | null;
   agentStatus: AgentStatus;
@@ -49,6 +57,14 @@ export interface WechatCardState {
   loginState: WechatLoginState;
   botId: string | null;
   userId: string | null;
+  activeBotId: string | null;
+  connectedBotCount: number;
+  bots: Array<{
+    botId: string;
+    userId: string;
+    label: string | null;
+    lastPollAt: number | null;
+  }>;
   qrStatus: QrStatus | null;
   qrText: string | null;
   qrPath: string | null;
@@ -217,6 +233,7 @@ export interface GetConfigResp {
 
 export interface InboundMessage {
   messageId: number;
+  botId: string;
   fromUserId: string;
   toUserId: string;
   text: string;

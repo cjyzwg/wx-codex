@@ -7,18 +7,22 @@ import { AgentRuntime } from "../runtime/agentRuntime.js";
 import { WechatStore } from "../store/wechatStore.js";
 
 class MemoryStore extends WechatStore {
-  private account: {
+  private accounts: Array<{
     botToken: string;
     botId: string;
     userId: string;
     baseUrl: string;
     savedAt: number;
-  } | null = null;
+    label?: string;
+  }> = [];
+  private activeBotId: string | null = null;
 
   private state: RuntimeState = {
     updatesBuf: "",
+    updatesBufByBot: {},
     contextTokens: {},
     lastMessageId: 0,
+    lastMessageIdByBot: {},
     threadSessions: {},
     legacySharedThreadId: null,
     agentStatus: "stopped",
@@ -33,13 +37,55 @@ class MemoryStore extends WechatStore {
   override ensureDataDir(): void {}
   override getQrPngPath(): string { return "memory.png"; }
   override getQrTxtPath(): string { return "memory.txt"; }
-  override loadAccount() { return this.account; }
-  override saveAccount(account: NonNullable<MemoryStore["account"]>): void { this.account = account; }
-  override clearAccount(): void { this.account = null; }
+  override loadAccounts() { return this.accounts.map((account) => ({ ...account })); }
+  override loadAccount(botId?: string) {
+    if (botId) {
+      return this.accounts.find((account) => account.botId === botId) || null;
+    }
+    const active = this.accounts.find((account) => account.botId === this.activeBotId);
+    return active ? { ...active } : this.accounts[0] ? { ...this.accounts[0] } : null;
+  }
+  override saveAccount(account: MemoryStore["accounts"][number]): void {
+    const index = this.accounts.findIndex((item) => item.botId === account.botId);
+    if (index >= 0) {
+      this.accounts[index] = { ...account };
+      this.activeBotId ??= account.botId;
+      return;
+    }
+    this.accounts.push({ ...account });
+    this.activeBotId ??= account.botId;
+  }
+  override updateAccountLabel(botId: string, label: string | null) {
+    const index = this.accounts.findIndex((account) => account.botId === botId);
+    if (index < 0) {
+      return null;
+    }
+    this.accounts[index] = {
+      ...this.accounts[index],
+      label: label?.trim() ? label.trim() : undefined,
+    };
+    return { ...this.accounts[index] };
+  }
+  override setActiveBotId(botId: string | null): void {
+    this.activeBotId = botId && this.accounts.some((account) => account.botId === botId) ? botId : this.accounts[0]?.botId || null;
+  }
+  override clearAccount(botId?: string): void {
+    if (!botId) {
+      this.accounts = [];
+      this.activeBotId = null;
+      return;
+    }
+    this.accounts = this.accounts.filter((account) => account.botId !== botId);
+    if (this.activeBotId === botId) {
+      this.activeBotId = this.accounts[0]?.botId || null;
+    }
+  }
   override loadState(): RuntimeState {
     return {
       ...this.state,
       contextTokens: { ...this.state.contextTokens },
+      updatesBufByBot: { ...(this.state.updatesBufByBot || {}) },
+      lastMessageIdByBot: { ...(this.state.lastMessageIdByBot || {}) },
       threadSessions: Object.fromEntries(
         Object.entries(this.state.threadSessions).map(([key, value]) => [
           key,
@@ -56,6 +102,8 @@ class MemoryStore extends WechatStore {
     this.state = {
       ...state,
       contextTokens: { ...state.contextTokens },
+      updatesBufByBot: { ...(state.updatesBufByBot || {}) },
+      lastMessageIdByBot: { ...(state.lastMessageIdByBot || {}) },
       threadSessions: Object.fromEntries(
         Object.entries(state.threadSessions).map(([key, value]) => [
           key,
@@ -75,8 +123,10 @@ class MemoryStore extends WechatStore {
   override resetState(): RuntimeState {
     this.state = {
       updatesBuf: "",
+      updatesBufByBot: {},
       contextTokens: {},
       lastMessageId: 0,
+      lastMessageIdByBot: {},
       threadSessions: {},
       legacySharedThreadId: null,
       agentStatus: "stopped",
@@ -100,12 +150,20 @@ function createConfig(): AppConfig {
 
 function createWechatClient(store: MemoryStore) {
   return {
+    getAccounts: () => store.loadAccounts(),
     getAccount: () => store.loadAccount(),
+    setActiveBotId: (botId: string | null) => store.setActiveBotId(botId),
     getState: () => store.loadState(),
     saveState: (state: RuntimeState) => store.saveState(state),
     startQrLogin: vi.fn(),
     checkQrStatus: vi.fn(),
-    clearLogin: vi.fn(() => store.resetState()),
+    clearLogin: vi.fn((botId?: string) => {
+      if (botId) {
+        store.clearAccount(botId);
+        return store.loadState();
+      }
+      return store.resetState();
+    }),
     pollMessages: vi.fn(async ({ signal }: { signal?: AbortSignal } = {}): Promise<InboundMessage[]> => {
       return new Promise((resolve) => {
         signal?.addEventListener("abort", () => resolve([]), { once: true });
@@ -144,9 +202,20 @@ function saveAccount(store: MemoryStore): void {
   });
 }
 
+function saveSecondAccount(store: MemoryStore): void {
+  store.saveAccount({
+    botToken: "token-b",
+    botId: "bot-b",
+    userId: "self-b",
+    baseUrl: "https://example-b.com",
+    savedAt: Date.now() + 1,
+  });
+}
+
 function message(input: Partial<InboundMessage> = {}): InboundMessage {
   return {
     messageId: 1,
+    botId: "bot-id",
     fromUserId: "user-a",
     toUserId: "bot-id",
     text: "hello world",
@@ -220,6 +289,41 @@ describe("AgentRuntime", () => {
     expect(store.loadState().threadSessions["bot-id:user-a"]?.activeThreadId).toBe("thread-123");
     expect(turns[0]).toContain("来自用户 user-a");
     expect(turns[0]).toContain("hello world");
+  });
+
+  it("isolates thread sessions for the same WeChat user across different bots", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+    saveSecondAccount(store);
+
+    const turns: string[] = [];
+    const wechatClient = createWechatClient(store);
+    const codexBridge = createCodexBridge({
+      ensureThread: vi
+        .fn()
+        .mockResolvedValueOnce("thread-bot-a")
+        .mockResolvedValueOnce("thread-bot-b"),
+      runTurn: vi.fn(async (prompt: string) => {
+        turns.push(prompt);
+        return { replyText: "done", streamedAny: false, finalAlreadyStreamed: false };
+      }),
+    });
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: codexBridge as never,
+    });
+
+    await runtime.initialize();
+    const handleSingleMessage = getHandleSingleMessage(runtime);
+    await handleSingleMessage(message({ botId: "bot-id", fromUserId: "shared-user", text: "bot a hi" }));
+    await handleSingleMessage(message({ botId: "bot-b", fromUserId: "shared-user", text: "bot b hi" }));
+
+    expect(store.loadState().threadSessions["bot-id:shared-user"]?.activeThreadId).toBe("thread-bot-a");
+    expect(store.loadState().threadSessions["bot-b:shared-user"]?.activeThreadId).toBe("thread-bot-b");
+    expect(turns[0]).toContain("shared-user");
+    expect(turns[1]).toContain("shared-user");
   });
 
   it("records codex errors when availability is missing", async () => {
@@ -305,6 +409,146 @@ describe("AgentRuntime", () => {
     await runtime.stop();
   });
 
+  it("logs out only the active WeChat bot and preserves the others", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+    saveSecondAccount(store);
+    const state = store.loadState();
+    state.contextTokens["bot-id:user-a"] = "ctx-a";
+    state.contextTokens["bot-b:user-b"] = "ctx-b";
+    state.threadSessions["bot-id:user-a"] = {
+      activeThreadId: "thread-a",
+      lastUsedAt: 1,
+      threads: [{ threadId: "thread-a", createdAt: 1, lastUsedAt: 1, displayCwd: null, cwdSource: "unknown" }],
+    };
+    state.threadSessions["bot-b:user-b"] = {
+      activeThreadId: "thread-b",
+      lastUsedAt: 2,
+      threads: [{ threadId: "thread-b", createdAt: 2, lastUsedAt: 2, displayCwd: null, cwdSource: "unknown" }],
+    };
+    store.saveState(state);
+
+    const wechatClient = createWechatClient(store);
+    const codexBridge = createCodexBridge();
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: codexBridge as never,
+    });
+
+    await runtime.initialize();
+    await runtime.logoutActiveWechat();
+
+    expect(store.loadAccounts().map((account) => account.botId)).toEqual(["bot-b"]);
+    expect(store.loadState().contextTokens["bot-id:user-a"]).toBeUndefined();
+    expect(store.loadState().contextTokens["bot-b:user-b"]).toBe("ctx-b");
+    expect(store.loadState().threadSessions["bot-id:user-a"]).toBeUndefined();
+    expect(store.loadState().threadSessions["bot-b:user-b"]?.activeThreadId).toBe("thread-b");
+    expect(runtime.getSnapshot().wechat.activeBotId).toBe("bot-b");
+  });
+
+  it("cycles the active WeChat bot and uses the selected one for removal", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+    saveSecondAccount(store);
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: createWechatClient(store) as never,
+      codexBridge: createCodexBridge() as never,
+    });
+
+    await runtime.initialize();
+
+    expect(runtime.getSnapshot().wechat.activeBotId).toBe("bot-id");
+
+    runtime.cycleActiveWechatBot();
+    expect(runtime.getSnapshot().wechat.activeBotId).toBe("bot-b");
+
+    runtime.cycleActiveWechatBot();
+    expect(runtime.getSnapshot().wechat.activeBotId).toBe("bot-id");
+
+    runtime.cycleActiveWechatBot();
+    await runtime.logoutActiveWechat();
+    expect(store.loadAccounts().map((account) => account.botId)).toEqual(["bot-id"]);
+  });
+
+  it("automatically refreshes the QR code when the server marks it expired", async () => {
+    const store = new MemoryStore();
+    const wechatClient = createWechatClient(store);
+    wechatClient.startQrLogin.mockResolvedValueOnce({
+      qrStatus: "wait",
+      qrText: "QR-1",
+      qrPath: "/tmp/qr-1.png",
+      qrUrl: "https://example.com/qr-1.png",
+    });
+    wechatClient.checkQrStatus.mockResolvedValueOnce({ status: "expired" });
+    wechatClient.startQrLogin.mockResolvedValueOnce({
+      qrStatus: "wait",
+      qrText: "QR-2",
+      qrPath: "/tmp/qr-2.png",
+      qrUrl: "https://example.com/qr-2.png",
+    });
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: createCodexBridge() as never,
+    });
+
+    await runtime.initialize();
+    await runtime.beginWechatLogin(false);
+    await (runtime as unknown as { pollQrStatus: () => Promise<void> }).pollQrStatus();
+
+    expect(wechatClient.startQrLogin).toHaveBeenNthCalledWith(1, false);
+    expect(wechatClient.startQrLogin).toHaveBeenNthCalledWith(2, true);
+    expect(runtime.getSnapshot().wechat.qrStatus).toBe("wait");
+    expect(runtime.getSnapshot().wechat.qrUrl).toBe("https://example.com/qr-2.png");
+  });
+
+  it("renames the active bot with /botname and exposes the label in the snapshot", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+
+    const wechatClient = createWechatClient(store);
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: createCodexBridge() as never,
+    });
+
+    await runtime.initialize();
+    await getHandleSingleMessage(runtime)(message({ text: "/botname 主微信" }));
+
+    expect(store.loadAccount("bot-id")?.label).toBe("主微信");
+    expect(runtime.getSnapshot().wechat.activeBotId).toBe("bot-id");
+    expect(runtime.getSnapshot().wechat.bots[0]?.label).toBe("主微信");
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("主微信"), undefined, "bot-id");
+  });
+
+  it("shows the current bot label and can clear it with /botname clear", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+    store.updateAccountLabel("bot-id", "主微信");
+
+    const wechatClient = createWechatClient(store);
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: createCodexBridge() as never,
+    });
+
+    await runtime.initialize();
+    const handleSingleMessage = getHandleSingleMessage(runtime);
+
+    await handleSingleMessage(message({ text: "/botname" }));
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", "当前微信账号备注：主微信", undefined, "bot-id");
+
+    await handleSingleMessage(message({ text: "/botname clear" }));
+    expect(store.loadAccount("bot-id")?.label).toBeUndefined();
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", "已清空当前微信账号备注名。", undefined, "bot-id");
+  });
+
   it("creates a new active thread when the sender sends /new", async () => {
     const store = new MemoryStore();
     saveAccount(store);
@@ -337,7 +581,7 @@ describe("AgentRuntime", () => {
         cwdSource?: string;
       })?.cwdSource,
     ).toBe("created_here");
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("已切换到新会话"));
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("已切换到新会话"), undefined, "bot-id");
     expect((runtime.getSnapshot().codex as { threadCwd?: string | null }).threadCwd).toBe(process.cwd());
     expect(codexBridge.runTurn).not.toHaveBeenCalled();
   });
@@ -366,10 +610,10 @@ describe("AgentRuntime", () => {
     await runtime.initialize();
     await getHandleSingleMessage(runtime)(message({ text: "/threads" }));
 
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("1."));
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("2."));
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("cwd: /repo/alpha"));
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("cwd: unknown (external thread)"));
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("1."), undefined, "bot-id");
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("2."), undefined, "bot-id");
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("cwd: /repo/alpha"), undefined, "bot-id");
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("cwd: unknown (external thread)"), undefined, "bot-id");
     expect(codexBridge.runTurn).not.toHaveBeenCalled();
   });
 
@@ -398,7 +642,7 @@ describe("AgentRuntime", () => {
     await getHandleSingleMessage(runtime)(message({ text: "/use 2" }));
 
     expect(store.loadState().threadSessions["bot-id:user-a"]?.activeThreadId).toBe("thread-2");
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("thread-2"));
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("thread-2"), undefined, "bot-id");
     expect(codexBridge.runTurn).not.toHaveBeenCalled();
   });
 
@@ -427,7 +671,7 @@ describe("AgentRuntime", () => {
     await getHandleSingleMessage(runtime)(message({ text: "/use 5678" }));
 
     expect(store.loadState().threadSessions["bot-id:user-a"]?.activeThreadId).toBe("thread-beta-5678");
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("thread-beta-5678"));
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("thread-beta-5678"), undefined, "bot-id");
   });
 
   it("attaches an existing codex thread id even when it is not already in the local thread list", async () => {
@@ -461,7 +705,7 @@ describe("AgentRuntime", () => {
         cwdSource?: string;
       })?.cwdSource,
     ).toBe("attached_external");
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("external-thread-abc123"));
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("external-thread-abc123"), undefined, "bot-id");
     expect((runtime.getSnapshot().codex as { threadCwd?: string | null }).threadCwd).toBe("unknown (external thread)");
   });
 
@@ -490,7 +734,7 @@ describe("AgentRuntime", () => {
     expect(thread?.displayCwd).toBe("/repo/external");
     expect(thread?.cwdSource).toBe("attached_external");
     expect((runtime.getSnapshot().codex as { threadCwd?: string | null }).threadCwd).toBe("/repo/external");
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("cwd: /repo/external"));
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("cwd: /repo/external"), undefined, "bot-id");
   });
 
   it("exposes the active thread cwd in the codex snapshot for the tui", async () => {
@@ -538,7 +782,7 @@ describe("AgentRuntime", () => {
     await getHandleSingleMessage(runtime)(message({ text: "/threads" }));
 
     const wechatClient = runtime as unknown as { wechatClient: { sendText: ReturnType<typeof vi.fn> } };
-    expect(wechatClient.wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("cwd: /repo/external"));
+    expect(wechatClient.wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("cwd: /repo/external"), undefined, "bot-id");
   });
 
   it("replies directly for unsupported message types without calling codex", async () => {
@@ -562,7 +806,7 @@ describe("AgentRuntime", () => {
       directReplyText: "该消息类型不支持",
     }));
 
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-b", "该消息类型不支持");
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-b", "该消息类型不支持", undefined, "bot-id");
     expect(codexBridge.runTurn).not.toHaveBeenCalled();
   });
 
@@ -632,7 +876,7 @@ describe("AgentRuntime", () => {
       media: [{ kind: "image", path: "C:\\temp\\image.jpg", source: "item", contentType: "image/jpeg" }],
     }));
 
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-c", "已经收到你的图片了，请问你要我做什么？");
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-c", "已经收到你的图片了，请问你要我做什么？", undefined, "bot-id");
     expect(codexBridge.runTurn).not.toHaveBeenCalled();
 
     await handleSingleMessage(message({
@@ -680,6 +924,8 @@ describe("AgentRuntime", () => {
     expect(wechatClient.sendText).toHaveBeenCalledWith(
       "user-d",
       "第1句。\n第2句。\n第3句。\n第4句。\n第5句。\n第6句。\n第7句。\n第8句。\n第9句。\n第10句。\n第11句。\n第12句。",
+      undefined,
+      "bot-id",
     );
   });
 
@@ -709,7 +955,7 @@ describe("AgentRuntime", () => {
     }));
 
     expect(wechatClient.sendText).toHaveBeenCalledTimes(1);
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-e", "当前这个项目根目录下主要有这些目录：\n- dist\n- happy\n- src");
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-e", "当前这个项目根目录下主要有这些目录：\n- dist\n- happy\n- src", undefined, "bot-id");
   });
 
   it("splits an overlong final reply into a few natural WeChat messages", async () => {
@@ -768,8 +1014,8 @@ describe("AgentRuntime", () => {
       text: "把结果发我",
     }));
 
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-f", "分析完成。");
-    expect(wechatClient.sendLocalFile).toHaveBeenCalledWith("user-f", "/tmp/report.txt");
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-f", "分析完成。", undefined, "bot-id");
+    expect(wechatClient.sendLocalFile).toHaveBeenCalledWith("user-f", "/tmp/report.txt", undefined, "bot-id");
     expect(wechatClient.sendText).not.toHaveBeenCalledWith("user-f", expect.stringContaining("[[wx_send:"));
   });
 
@@ -800,7 +1046,7 @@ describe("AgentRuntime", () => {
       contextToken: "ctx-current-turn",
     }));
 
-    expect(wechatClient.sendTypingIndicator).toHaveBeenCalledWith("user-g", "typing", "ctx-current-turn");
-    expect(wechatClient.sendText).toHaveBeenCalledWith("user-g", "当前这条消息的回复", "ctx-current-turn");
+    expect(wechatClient.sendTypingIndicator).toHaveBeenCalledWith("user-g", "typing", "ctx-current-turn", "bot-id");
+    expect(wechatClient.sendText).toHaveBeenCalledWith("user-g", "当前这条消息的回复", "ctx-current-turn", "bot-id");
   });
 });

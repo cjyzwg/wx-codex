@@ -20,6 +20,10 @@ function line(label: string, value: string): string {
   return `${label}: ${value}`;
 }
 
+function formatBotLabel(bot: { botId: string; userId: string; label: string | null }): string {
+  return bot.label || `${bot.botId} | ${bot.userId}`;
+}
+
 function cardColor(status: string): string {
   switch (status) {
     case "logged_in":
@@ -54,6 +58,9 @@ export function App({ runtime }: AppProps): React.JSX.Element {
     }
 
     if (busyAction) {
+      if (key.tab) {
+        runtime.cycleActiveWechatBot();
+      }
       return;
     }
 
@@ -61,6 +68,11 @@ export function App({ runtime }: AppProps): React.JSX.Element {
     if (normalized === "q" || (key.ctrl && input === "c")) {
       setBusyAction("Exiting...");
       void runtime.shutdown().finally(() => exit());
+      return;
+    }
+
+    if (key.tab) {
+      runtime.cycleActiveWechatBot();
       return;
     }
 
@@ -83,6 +95,12 @@ export function App({ runtime }: AppProps): React.JSX.Element {
       return;
     }
 
+    if (normalized === "d") {
+      setBusyAction("Removing active WeChat...");
+      void runtime.logoutActiveWechat().finally(() => setBusyAction(null));
+      return;
+    }
+
     if (normalized === "c") {
       setBusyAction("Reconnecting Codex...");
       void runtime.reconnectCodex().finally(() => setBusyAction(null));
@@ -95,6 +113,7 @@ export function App({ runtime }: AppProps): React.JSX.Element {
   const showingQr = snapshot.wechat.loginState === "logging_in" && Boolean(snapshot.wechat.qrText);
   const qrLines = splitQrLines(snapshot.wechat.qrText || "");
   const canShowQr = showingQr && canRenderQrBlock(width, snapshot.wechat.qrText || "");
+  const activeBot = snapshot.wechat.bots.find((bot) => bot.botId === snapshot.wechat.activeBotId) || null;
 
   return (
     <Box flexDirection="column" width={width}>
@@ -107,10 +126,20 @@ export function App({ runtime }: AppProps): React.JSX.Element {
         <Box width="33%" borderStyle="round" borderColor={cardColor(snapshot.wechat.loginState)} flexDirection="column" paddingX={1}>
           <Text bold color={cardColor(snapshot.wechat.loginState)}>WeChat</Text>
           <Text>{line("State", snapshot.wechat.loginState)}</Text>
-          <Text>{line("Bot", snapshot.wechat.botId || "-")}</Text>
+          <Text>{line("Bots", String(snapshot.wechat.connectedBotCount))}</Text>
+          <Text>{line("Active", activeBot ? formatBotLabel(activeBot) : snapshot.wechat.activeBotId || snapshot.wechat.botId || "-")}</Text>
           <Text>{line("User", snapshot.wechat.userId || "-")}</Text>
           <Text>{line("QR", snapshot.wechat.qrStatus || "-")}</Text>
           <Text>{line("Last poll", formatTimestamp(snapshot.wechat.lastPollAt))}</Text>
+          {snapshot.wechat.bots.length === 0 ? (
+            <Text color="gray">No connected bots.</Text>
+          ) : (
+            snapshot.wechat.bots.slice(0, 4).map((bot) => (
+              <Text key={bot.botId} color="gray">
+                {formatBotLabel(bot)} | {formatTimestamp(bot.lastPollAt)}
+              </Text>
+            ))
+          )}
         </Box>
 
         <Box width="34%" marginLeft={1} borderStyle="round" borderColor={cardColor(snapshot.codex.status)} flexDirection="column" paddingX={1}>
@@ -165,7 +194,7 @@ export function App({ runtime }: AppProps): React.JSX.Element {
 
       <Box marginTop={1} borderStyle="round" borderColor={busyAction ? "yellow" : "green"} flexDirection="column" paddingX={1}>
         <Text>
-          {busyAction || "Keys: S start/stop agent, L login WeChat, R relogin WeChat, C reconnect Codex, Esc close overlay, Q quit"}
+          {busyAction || "Keys: Tab switch active WeChat, S start/stop agent, L add WeChat, D remove active WeChat, R reset all WeChat, C reconnect Codex, Esc close overlay, Q quit"}
         </Text>
       </Box>
     </Box>

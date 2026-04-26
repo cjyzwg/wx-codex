@@ -11,6 +11,7 @@ vi.mock("../wechat/api.js", async () => {
     sendMessage: vi.fn(async () => undefined),
     getConfig: vi.fn(async () => ({ typing_ticket: "ticket-1" })),
     sendTyping: vi.fn(async () => undefined),
+    pollQrStatus: vi.fn(async () => ({ status: "wait" })),
   };
 });
 
@@ -82,5 +83,21 @@ describe("WechatClient explicit context token overrides", () => {
       toUserId: "user-a",
       filePath,
     });
+  });
+
+  it("does not treat an existing logged-in account as confirmation for a newly generated QR login", async () => {
+    const client = createClient();
+    const store = (client as unknown as { store: WechatStore }).store;
+    saveAccount(store);
+    store.saveQrState({
+      qrcode: "qr-new",
+      qrcodeUrl: "https://example.com/qr-new.png",
+      createdAt: Date.now(),
+    });
+
+    const result = await client.checkQrStatus();
+
+    expect(result.status).toBe("wait");
+    expect(vi.mocked(api.pollQrStatus)).toHaveBeenCalledTimes(1);
   });
 });

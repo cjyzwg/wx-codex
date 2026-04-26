@@ -34,6 +34,16 @@ function saveAccount(store: WechatStore): void {
   });
 }
 
+function saveSecondAccount(store: WechatStore): void {
+  store.saveAccount({
+    botToken: "token-b",
+    botId: "bot-b",
+    userId: "self-b",
+    baseUrl: "https://example-b.com",
+    savedAt: Date.now() + 1,
+  });
+}
+
 function rawMessage(id: number) {
   return {
     message_type: 1,
@@ -78,5 +88,43 @@ describe("WechatClient polling", () => {
 
     expect(first.map((message) => message.messageId)).toEqual([110, 109, 108, 107, 106, 105, 104, 103, 102, 101]);
     expect(second.map((message) => message.messageId)).toEqual([100, 99, 98, 97, 96]);
+  });
+
+  it("polls different bots with isolated update buffers and tags inbound messages by bot", async () => {
+    const client = createClient();
+    const store = (client as unknown as { store: WechatStore }).store;
+    saveAccount(store);
+    saveSecondAccount(store);
+
+    vi.mocked(api.getUpdates)
+      .mockResolvedValueOnce({
+        ret: 0,
+        get_updates_buf: "buf-a-1",
+        msgs: [rawMessage(201)],
+      })
+      .mockResolvedValueOnce({
+        ret: 0,
+        get_updates_buf: "buf-b-1",
+        msgs: [rawMessage(301)],
+      });
+
+    const first = await client.pollMessages({ timeoutMs: 1, botId: "bot-id" });
+    const second = await client.pollMessages({ timeoutMs: 1, botId: "bot-b" });
+    const state = store.loadState();
+
+    expect(first[0]?.botId).toBe("bot-id");
+    expect(second[0]?.botId).toBe("bot-b");
+    expect(vi.mocked(api.getUpdates).mock.calls[0]?.[0]).toMatchObject({
+      baseUrl: "https://example.com",
+      token: "token",
+      updatesBuf: "",
+    });
+    expect(vi.mocked(api.getUpdates).mock.calls[1]?.[0]).toMatchObject({
+      baseUrl: "https://example-b.com",
+      token: "token-b",
+      updatesBuf: "",
+    });
+    expect(state.contextTokens["bot-id:user-a"]).toBe("ctx-201");
+    expect(state.contextTokens["bot-b:user-a"]).toBe("ctx-301");
   });
 });

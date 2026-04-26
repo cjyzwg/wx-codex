@@ -27,8 +27,12 @@ const MessageState = {
 export class WechatClient {
   constructor(private readonly store: WechatStore) {}
 
-  getAccount(): AccountData | null {
-    return this.store.loadAccount();
+  getAccounts(): AccountData[] {
+    return this.store.loadAccounts();
+  }
+
+  getAccount(botId?: string): AccountData | null {
+    return this.store.loadAccount(botId);
   }
 
   getState(): RuntimeState {
@@ -39,22 +43,16 @@ export class WechatClient {
     this.store.saveState(state);
   }
 
+  setActiveBotId(botId: string | null): void {
+    this.store.setActiveBotId(botId);
+  }
+
   async startQrLogin(forceNew = false): Promise<{
     qrStatus: QrStatus;
     qrText: string;
     qrPath: string;
     qrUrl: string;
   }> {
-    const existingAccount = this.store.loadAccount();
-    if (existingAccount && !forceNew) {
-      return {
-        qrStatus: "confirmed",
-        qrText: this.store.readQrText() || "Already logged in.",
-        qrPath: this.store.getQrPngPath(),
-        qrUrl: "",
-      };
-    }
-
     const existingQrState = this.store.loadQrState();
     if (!forceNew && existingQrState && Date.now() - existingQrState.createdAt < QR_TTL_MS) {
       const qrText = this.store.readQrText() || (await this.writeQrArtifacts(existingQrState.qrcodeUrl));
@@ -83,19 +81,18 @@ export class WechatClient {
   }
 
   async checkQrStatus(): Promise<QRStatusResponse> {
-    const account = this.store.loadAccount();
-    if (account) {
-      return {
-        status: "confirmed",
-        bot_token: account.botToken,
-        ilink_bot_id: account.botId,
-        ilink_user_id: account.userId,
-        baseurl: account.baseUrl,
-      };
-    }
-
     const qrState = this.store.loadQrState();
     if (!qrState) {
+      const account = this.store.loadAccount();
+      if (account) {
+        return {
+          status: "confirmed",
+          bot_token: account.botToken,
+          ilink_bot_id: account.botId,
+          ilink_user_id: account.userId,
+          baseurl: account.baseUrl,
+        };
+      }
       throw new Error("No QR login in progress.");
     }
 
@@ -125,20 +122,25 @@ export class WechatClient {
     return result;
   }
 
-  clearLogin(): RuntimeState {
+  clearLogin(botId?: string): RuntimeState {
     this.store.clearQrState();
-    this.store.clearAccount();
+    this.store.clearAccount(botId);
+    if (botId) {
+      return this.store.loadState();
+    }
     return this.store.resetState();
   }
 
-  async pollMessages(params: { timeoutMs: number; signal?: AbortSignal }): Promise<InboundMessage[]> {
-    const account = this.requireAccount();
+  async pollMessages(params: { timeoutMs: number; signal?: AbortSignal; botId?: string }): Promise<InboundMessage[]> {
+    const account = this.requireAccount(params.botId);
     const state = this.store.loadState();
+    const hasPerBotState = Boolean(state.updatesBufByBot && Object.keys(state.updatesBufByBot).length > 0);
+    const updatesBuf = state.updatesBufByBot?.[account.botId] ?? (!hasPerBotState ? state.updatesBuf : "");
 
     const response = await getUpdates({
       baseUrl: account.baseUrl,
       token: account.botToken,
-      updatesBuf: state.updatesBuf,
+      updatesBuf,
       timeoutMs: params.timeoutMs,
       signal: params.signal,
     });
@@ -150,6 +152,10 @@ export class WechatClient {
     const nextState = { ...state };
     if (response.get_updates_buf) {
       nextState.updatesBuf = response.get_updates_buf;
+      nextState.updatesBufByBot = {
+        ...(nextState.updatesBufByBot || {}),
+        [account.botId]: response.get_updates_buf,
+      };
     }
 
     const newMessages = (response.msgs || []).filter(
@@ -158,6 +164,10 @@ export class WechatClient {
 
     if (newMessages.length > 0) {
       nextState.lastMessageId = Math.max(...newMessages.map((message) => message.message_id || 0));
+      nextState.lastMessageIdByBot = {
+        ...(nextState.lastMessageIdByBot || {}),
+        [account.botId]: nextState.lastMessageId,
+      };
       for (const message of newMessages) {
         const key = `${account.botId}:${message.from_user_id}`;
         if (message.context_token) {
@@ -167,11 +177,11 @@ export class WechatClient {
     }
 
     this.store.saveState(nextState);
-    return Promise.all(newMessages.map((message) => this.formatMessage(message)));
+    return Promise.all(newMessages.map((message) => this.formatMessage(account.botId, message)));
   }
 
-  async sendText(to: string, text: string, contextTokenOverride?: string): Promise<void> {
-    const account = this.requireAccount();
+  async sendText(to: string, text: string, contextTokenOverride?: string, botId?: string): Promise<void> {
+    const account = this.requireAccount(botId);
     const contextToken = this.resolveContextToken(account.botId, to, contextTokenOverride);
 
     await sendMessage({
@@ -191,8 +201,8 @@ export class WechatClient {
     });
   }
 
-  async sendTypingIndicator(to: string, status: "typing" | "cancel", contextTokenOverride?: string): Promise<void> {
-    const account = this.requireAccount();
+  async sendTypingIndicator(to: string, status: "typing" | "cancel", contextTokenOverride?: string, botId?: string): Promise<void> {
+    const account = this.requireAccount(botId);
     const contextToken = this.resolveContextToken(account.botId, to, contextTokenOverride);
     if (!contextToken) {
       throw new Error(`No WeChat conversation context found for user ${to}.`);
@@ -220,8 +230,8 @@ export class WechatClient {
     });
   }
 
-  async sendLocalFile(to: string, filePath: string, contextTokenOverride?: string): Promise<void> {
-    const account = this.requireAccount();
+  async sendLocalFile(to: string, filePath: string, contextTokenOverride?: string, botId?: string): Promise<void> {
+    const account = this.requireAccount(botId);
     if (!path.isAbsolute(filePath)) {
       throw new Error(`WeChat file send only supports absolute paths: ${filePath}`);
     }
@@ -245,8 +255,8 @@ export class WechatClient {
     });
   }
 
-  private requireAccount(): AccountData {
-    const account = this.store.loadAccount();
+  private requireAccount(botId?: string): AccountData {
+    const account = this.store.loadAccount(botId);
     if (!account) {
       throw new Error("WeChat is not logged in.");
     }
@@ -270,7 +280,7 @@ export class WechatClient {
     return qrText;
   }
 
-  private async formatMessage(message: WeixinMessage): Promise<InboundMessage> {
+  private async formatMessage(botId: string, message: WeixinMessage): Promise<InboundMessage> {
     const textParts: string[] = [];
     const media: InboundMedia[] = [];
     const items = message.item_list || [];
@@ -361,6 +371,7 @@ export class WechatClient {
 
     return {
       messageId: message.message_id || 0,
+      botId,
       fromUserId: message.from_user_id || "",
       toUserId: message.to_user_id || "",
       text,

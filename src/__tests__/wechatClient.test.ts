@@ -35,7 +35,7 @@ describe("WechatClient voice formatting", () => {
     const client = createClient();
 
     const formatted = await (client as unknown as {
-      formatMessage: (message: Record<string, unknown>) => Promise<{
+      formatMessage: (botId: string, message: Record<string, unknown>) => Promise<{
         text: string;
         directReplyText?: string;
         voice?: {
@@ -44,7 +44,7 @@ describe("WechatClient voice formatting", () => {
           sampleRate?: number | null;
         };
       }>;
-    }).formatMessage({
+    }).formatMessage("bot-id", {
       message_id: 1,
       from_user_id: "user-a",
       to_user_id: "bot-id",
@@ -73,11 +73,11 @@ describe("WechatClient voice formatting", () => {
     const client = createClient();
 
     const formatted = await (client as unknown as {
-      formatMessage: (message: Record<string, unknown>) => Promise<{
+      formatMessage: (botId: string, message: Record<string, unknown>) => Promise<{
         text: string;
         directReplyText?: string;
       }>;
-    }).formatMessage({
+    }).formatMessage("bot-id", {
       message_id: 2,
       from_user_id: "user-b",
       to_user_id: "bot-id",
