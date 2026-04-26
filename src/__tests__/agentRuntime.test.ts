@@ -445,6 +445,7 @@ describe("AgentRuntime", () => {
     expect(store.loadState().threadSessions["bot-id:user-a"]).toBeUndefined();
     expect(store.loadState().threadSessions["bot-b:user-b"]?.activeThreadId).toBe("thread-b");
     expect(runtime.getSnapshot().wechat.activeBotId).toBe("bot-b");
+    expect(runtime.getSnapshot().agent.status).toBe("stopped");
   });
 
   it("cycles the active WeChat bot and uses the selected one for removal", async () => {
@@ -506,6 +507,96 @@ describe("AgentRuntime", () => {
     expect(runtime.getSnapshot().wechat.qrUrl).toBe("https://example.com/qr-2.png");
   });
 
+  it("can restart polling after removing the active bot without hitting a null abort controller race", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+    saveSecondAccount(store);
+
+    let firstPoll = true;
+    const wechatClient = createWechatClient(store);
+    wechatClient.pollMessages = vi.fn(async ({ signal }: { signal?: AbortSignal; botId?: string } = {}) => {
+      if (!signal) {
+        return [];
+      }
+
+      if (firstPoll) {
+        firstPoll = false;
+        return new Promise((resolve) => {
+          signal.addEventListener("abort", () => resolve([]), { once: true });
+        });
+      }
+
+      return [];
+    });
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: createCodexBridge() as never,
+    });
+
+    await runtime.initialize();
+    await runtime.start();
+    await runtime.logoutActiveWechat();
+
+    expect(runtime.getSnapshot().agent.status).toBe("running");
+    expect(runtime.getSnapshot().codex.status).toBe("idle");
+    expect(runtime.getSnapshot().events.some((event) => event.message.includes("Polling failed"))).toBe(false);
+
+    await runtime.stop();
+  });
+
+  it("keeps the agent running after removing the active bot when other bots remain", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+    saveSecondAccount(store);
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: createWechatClient(store) as never,
+      codexBridge: createCodexBridge() as never,
+    });
+
+    await runtime.initialize();
+    await runtime.start();
+    await runtime.logoutActiveWechat();
+
+    expect(store.loadAccounts().map((account) => account.botId)).toEqual(["bot-b"]);
+    expect(runtime.getSnapshot().agent.status).toBe("running");
+    expect(runtime.getSnapshot().codex.status).toBe("idle");
+
+    await runtime.stop();
+  });
+
+  it("stops cleanly without a polling failure when removing the last WeChat bot", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+
+    const wechatClient = createWechatClient(store);
+    wechatClient.pollMessages = vi.fn(async ({ signal }: { signal?: AbortSignal; botId?: string } = {}) => {
+      if (!signal) {
+        return [];
+      }
+      return new Promise((resolve) => {
+        signal.addEventListener("abort", () => resolve([]), { once: true });
+      });
+    });
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: createCodexBridge() as never,
+    });
+
+    await runtime.initialize();
+    await runtime.start();
+    await runtime.logoutActiveWechat();
+
+    expect(runtime.getSnapshot().agent.status).toBe("stopped");
+    expect(runtime.getSnapshot().wechat.connectedBotCount).toBe(0);
+    expect(runtime.getSnapshot().events.some((event) => event.message.includes("Polling failed"))).toBe(false);
+  });
+
   it("renames the active bot with /botname and exposes the label in the snapshot", async () => {
     const store = new MemoryStore();
     saveAccount(store);
@@ -526,6 +617,70 @@ describe("AgentRuntime", () => {
     expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", expect.stringContaining("主微信"), undefined, "bot-id");
   });
 
+  it("ignores duplicate inbound messages with the same bot and message id", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+
+    const turns: string[] = [];
+    const wechatClient = createWechatClient(store);
+    const codexBridge = createCodexBridge({
+      runTurn: vi.fn(async (prompt: string) => {
+        turns.push(prompt);
+        return { replyText: "done", streamedAny: false, finalAlreadyStreamed: false };
+      }),
+    });
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: codexBridge as never,
+    });
+
+    await runtime.initialize();
+    const handleSingleMessage = getHandleSingleMessage(runtime);
+    const duplicate = message({ messageId: 42, text: "重复消息" });
+
+    await handleSingleMessage(duplicate);
+    await handleSingleMessage(duplicate);
+
+    expect(codexBridge.runTurn).toHaveBeenCalledTimes(1);
+    expect(turns).toHaveLength(1);
+    expect(wechatClient.sendText).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs a duplicated inbound message only once at queue time", async () => {
+    const store = new MemoryStore();
+    saveAccount(store);
+
+    const duplicate = message({ messageId: 88, text: "重复日志" });
+    let pollCount = 0;
+    const wechatClient = createWechatClient(store);
+    wechatClient.pollMessages = vi.fn(async () => {
+      pollCount += 1;
+      if (pollCount === 1) {
+        return [duplicate, duplicate];
+      }
+      return [];
+    });
+
+    const runtime = new AgentRuntime(createConfig(), {
+      store,
+      wechatClient: wechatClient as never,
+      codexBridge: createCodexBridge() as never,
+    });
+
+    await runtime.initialize();
+    await runtime.start();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const receivedEvents = runtime
+      .getSnapshot()
+      .events.filter((event) => event.message.includes("Received message from") && event.message.includes("重复日志"));
+    expect(receivedEvents).toHaveLength(1);
+
+    await runtime.stop();
+  });
+
   it("shows the current bot label and can clear it with /botname clear", async () => {
     const store = new MemoryStore();
     saveAccount(store);
@@ -541,10 +696,10 @@ describe("AgentRuntime", () => {
     await runtime.initialize();
     const handleSingleMessage = getHandleSingleMessage(runtime);
 
-    await handleSingleMessage(message({ text: "/botname" }));
+    await handleSingleMessage(message({ messageId: 51, text: "/botname" }));
     expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", "当前微信账号备注：主微信", undefined, "bot-id");
 
-    await handleSingleMessage(message({ text: "/botname clear" }));
+    await handleSingleMessage(message({ messageId: 52, text: "/botname clear" }));
     expect(store.loadAccount("bot-id")?.label).toBeUndefined();
     expect(wechatClient.sendText).toHaveBeenCalledWith("user-a", "已清空当前微信账号备注名。", undefined, "bot-id");
   });

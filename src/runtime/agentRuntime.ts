@@ -52,6 +52,12 @@ type TypingTarget = {
   contextToken: string | null;
 };
 
+type SeenInboundMessage = {
+  seenAt: number;
+};
+
+const INBOUND_DEDUP_WINDOW_MS = 10 * 60_000;
+
 export class AgentRuntime {
   private readonly listeners = new Set<Listener>();
   private readonly store: WechatStore;
@@ -68,6 +74,7 @@ export class AgentRuntime {
   private typingInterval: NodeJS.Timeout | null = null;
   private currentTypingTarget: TypingTarget | null = null;
   private readonly pendingMediaByUser = new Map<string, PendingMediaContext>();
+  private readonly seenInboundMessages = new Map<string, SeenInboundMessage>();
 
   constructor(config: AppConfig, deps: RuntimeDeps = {}) {
     this.config = config;
@@ -276,21 +283,26 @@ export class AgentRuntime {
       return;
     }
 
-    const wasRunning = this.running;
+    const shouldRestart = this.running || this.snapshot.agent.status === "running";
     await this.stop();
     this.wechatClient.clearLogin(activeBotId);
     this.pruneRuntimeStateForBot(activeBotId);
     this.snapshot.wechat = this.buildWechatState();
     const nextState = this.store.loadState();
+    const remainingAccounts = this.wechatClient.getAccounts();
     this.setSnapshotThread(this.findMostRecentThreadId(nextState), nextState);
     this.snapshot.codex.status = this.snapshot.codex.available ? "disconnected" : "error";
-    this.snapshot.agent.status = "stopped";
     this.pushEvent("warn", `Removed WeChat bot ${activeBotId}.`);
-    this.publish();
 
-    if (wasRunning && this.wechatClient.getAccounts().length > 0) {
+    if (shouldRestart && remainingAccounts.length > 0) {
+      this.snapshot.agent.status = "running";
+      this.publish();
       await this.start();
+      return;
     }
+
+    this.snapshot.agent.status = "stopped";
+    this.publish();
   }
 
   cycleActiveWechatBot(): void {
@@ -350,20 +362,32 @@ export class AgentRuntime {
   private startPollingLoop(): void {
     const run = async () => {
       while (this.running) {
-        this.pollAbortController = new AbortController();
+        const controller = new AbortController();
+        this.pollAbortController = controller;
 
         try {
           for (const account of this.wechatClient.getAccounts()) {
+            if (!this.running || controller.signal.aborted) {
+              break;
+            }
+
             const messages = await this.wechatClient.pollMessages({
               timeoutMs: this.config.pollTimeoutMs,
-              signal: this.pollAbortController.signal,
+              signal: controller.signal,
               botId: account.botId,
             });
+
+            if (!this.running || controller.signal.aborted) {
+              break;
+            }
 
             this.updateBotLastPollAt(account.botId, Date.now());
             this.publish();
             if (messages.length > 0) {
               for (const message of messages) {
+                if (this.isDuplicateInboundMessage(message)) {
+                  continue;
+                }
                 this.queue.push(message);
                 this.pushEvent("info", `Received message from ${message.botId}/${message.fromUserId}: ${this.describeMessageForLog(message)}`);
               }
@@ -386,7 +410,9 @@ export class AgentRuntime {
           this.running = false;
           break;
         } finally {
-          this.pollAbortController = null;
+          if (this.pollAbortController === controller) {
+            this.pollAbortController = null;
+          }
         }
       }
     };
@@ -1270,6 +1296,30 @@ export class AgentRuntime {
   private compactText(text: string): string {
     const compact = text.replace(/\s+/g, " ").trim();
     return compact.length > 80 ? `${compact.slice(0, 77)}...` : compact;
+  }
+
+  private isDuplicateInboundMessage(message: InboundMessage): boolean {
+    if (!message.messageId || message.messageId <= 0) {
+      return false;
+    }
+
+    this.pruneSeenInboundMessages();
+    const key = `${message.botId}:${message.messageId}`;
+    if (this.seenInboundMessages.has(key)) {
+      return true;
+    }
+
+    this.seenInboundMessages.set(key, { seenAt: Date.now() });
+    return false;
+  }
+
+  private pruneSeenInboundMessages(): void {
+    const cutoff = Date.now() - INBOUND_DEDUP_WINDOW_MS;
+    for (const [key, value] of this.seenInboundMessages.entries()) {
+      if (value.seenAt < cutoff) {
+        this.seenInboundMessages.delete(key);
+      }
+    }
   }
 
   private publish(): void {
